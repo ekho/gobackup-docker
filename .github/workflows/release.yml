@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+      REF_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test gate
+        run: go test ./...
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Build and push (linux/amd64)
+        run: |
+          image=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')  # GHCR requires lowercase
+          docker build -t "$image:$REF_TAG" -t "$image:latest" .
+          docker push "$image:$REF_TAG"
+          docker push "$image:latest"
+      # Multi-arch (linux/arm64) needs buildx + QEMU; add if arm hosts are targeted.

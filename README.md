@@ -6,7 +6,8 @@ instead of hand-editing `gobackup.yml`.
 
 ## Status
 
-Design + Phase-0 spike complete; implementation starting.
+Working, tested (unit + two end-to-end), CI-gated. Pushing a `v*` tag publishes
+`ghcr.io/ekho/gobackup-docker:<tag>` and `:latest` (see `.github/workflows/release.yml`).
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — research brief, gobackup facts, chosen architecture (Option B),
   and the label schema / DRY mechanism (§5).
