@@ -18,3 +18,14 @@ Design + Phase-0 spike complete; implementation starting.
 
 `docker events` → parse `gobackup.*` labels → deep-merge with a shared defaults profile → render one `gobackup.yml` →
 **atomically write** it to a volume shared with the stock `gobackup` container, which reloads it via fsnotify.
+
+## Control-plane API (optional)
+
+Set `GOBACKUP_DOCKER_HTTP_ADDR` (e.g. `:2705`) to expose the supervisor's own state and a "backup now" action:
+
+- `GET /healthz` — liveness.
+- `GET /status` — JSON: instance, host id, discovered container/model counts, last render time, last error.
+- `POST /api/perform?model=<name>` — trigger a backup now, proxied to gobackup's `POST /api/perform`. Requires
+  `GOBACKUP_DOCKER_GOBACKUP_URL` (e.g. `http://gobackup:2703`) and only forwards models the supervisor rendered.
+
+gobackup's own `:2703` API (`/metrics`, `/api/config`, `/api/log`) remains available directly. Keep both on an internal network.

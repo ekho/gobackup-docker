@@ -15,6 +15,7 @@ import (
 	"github.com/ekho/gobackup-docker/internal/apply"
 	"github.com/ekho/gobackup-docker/internal/docker"
 	"github.com/ekho/gobackup-docker/internal/pipeline"
+	"github.com/ekho/gobackup-docker/internal/webapi"
 )
 
 func main() {
@@ -54,6 +55,16 @@ func main() {
 		case trigger <- struct{}{}:
 		default: // a reconcile is already pending
 		}
+	}
+
+	// Optional control-plane API (supervisor state + proxied "backup now").
+	if addr := os.Getenv("GOBACKUP_DOCKER_HTTP_ADDR"); addr != "" {
+		api := &webapi.Server{Status: rec.Status, GobackupURL: os.Getenv("GOBACKUP_DOCKER_GOBACKUP_URL")}
+		go func() {
+			if err := api.Serve(ctx, addr); err != nil {
+				log.Printf("[api] server error: %v", err)
+			}
+		}()
 	}
 
 	go dc.WatchEvents(ctx, fire)

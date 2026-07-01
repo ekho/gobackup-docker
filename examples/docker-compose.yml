@@ -16,6 +16,11 @@ services:
       GOBACKUP_DOCKER_DEFAULTS: /etc/gobackup-docker/defaults.yml
       # GOBACKUP_DOCKER_HOST_ID: prod-db-1   # override auto host suffix
       # GOBACKUP_DOCKER_INSTANCE: prod       # scope which containers this manages
+      GOBACKUP_DOCKER_HTTP_ADDR: ":2705"                  # optional control-plane API
+      GOBACKUP_DOCKER_GOBACKUP_URL: "http://gobackup:2703" # enables "backup now" proxy
+    ports:
+      - "2705:2705"                 # GET /healthz, GET /status, POST /api/perform?model=<name>
+    networks: [backup_net]          # reach gobackup:2703 for the perform proxy
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro   # discovery (consider a socket-proxy)
       - ./defaults.yml:/etc/gobackup-docker/defaults.yml:ro
