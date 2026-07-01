@@ -1,0 +1,52 @@
+# Reactive end-to-end: supervisor + gobackup run first (empty config), then a
+# labeled postgres is added — the supervisor renders it and gobackup's own cron
+# performs the backup automatically, with NO manual trigger.
+name: gbdreactive
+
+volumes:
+  cfg:
+  backups:
+
+networks:
+  bknet:
+
+services:
+  gobackup-docker:
+    image: gobackup-docker:dev
+    environment:
+      GOBACKUP_DOCKER_OUTPUT: /etc/gobackup/gobackup.yml
+      GOBACKUP_DOCKER_DEFAULTS: /etc/gobackup-docker/defaults.yml
+      GOBACKUP_DOCKER_DEBOUNCE: 300ms
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./defaults.yml:/etc/gobackup-docker/defaults.yml:ro
+      - cfg:/etc/gobackup
+
+  gobackup:
+    image: huacnlee/gobackup:latest
+    command: ["/usr/local/bin/gobackup", "run", "-c", "/etc/gobackup/gobackup.yml"]
+    restart: unless-stopped   # survive the initial empty/absent-config window
+    environment:
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - cfg:/etc/gobackup
+      - backups:/backups
+    networks: [bknet]
+
+  # Brought up LAST by run.sh to demonstrate reactive discovery.
+  postgres:
+    image: postgres:16
+    profiles: [addlater]      # not started by a bare `up`; run.sh starts it explicitly
+    environment:
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: appdb
+    networks: [bknet]
+    labels:
+      gobackup.enable: "true"
+      gobackup.name: "pgtest"
+      gobackup.databases.main.type: "postgresql"
+      gobackup.databases.main.host: "postgres"
+      gobackup.databases.main.port: "5432"
+      gobackup.databases.main.database: "appdb"
+      gobackup.databases.main.username: "postgres"
+      gobackup.databases.main.password: "$${POSTGRES_PASSWORD}"

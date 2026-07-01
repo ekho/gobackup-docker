@@ -1,0 +1,13 @@
+# Reactive e2e profile. schedule = every minute so a scheduled backup is
+# observable within the test (production would use a real cron).
+default:
+  schedule:
+    cron: "* * * * *"
+  compress_with:
+    type: tgz
+  default_storage: local
+  storages:
+    local:
+      type: local
+      path: /backups/{{ .Model }}
+      keep: 5
