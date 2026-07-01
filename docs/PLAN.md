@@ -125,7 +125,7 @@ gcs/azure/webdav/ftp/scp/sftp), notifiers (mail/webhook/slack/discord/telegram/h
 1. **Стратегия имён/коллизий моделей** — `<container>-<model>` vs `<instance>-<container>-<model>` vs хэш; что делать при
    дубликате имён между контейнерами.
 2. **Семантика debounce** — длительность (150ms…2s) и триггеры (только `start`/`die` или ещё `health_status`).
-3. **Гейтинг включения** — `exposedByDefault=false` (строгий opt-in, как Traefik по умолчанию рекомендует) vs `true`.
+3. **Гейтинг включения** — `exposedByDefault=false` (строгий opt-in) vs `true`.
 4. **Поведение при невалидном/битом конфиге** — не перезаписывать last-good, или писать и полагаться на last-good gobackup.
 
 ## Порядок работ

@@ -1,4 +1,4 @@
-// Command gobackup-docker is a Traefik-style supervisor: it watches Docker
+// Command gobackup-docker is a label-driven supervisor: it watches Docker
 // containers, reads gobackup.* labels, and renders a gobackup.yml that the
 // stock gobackup container hot-reloads. See docs/ARCHITECTURE.md.
 package main

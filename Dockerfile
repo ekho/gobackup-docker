@@ -10,6 +10,6 @@ FROM alpine:3.20
 # ca-certificates lets the Docker client reach a remote DOCKER_HOST over TLS.
 RUN apk add --no-cache ca-certificates
 COPY --from=build /out/gobackup-docker /usr/local/bin/gobackup-docker
-# Runs as root for /var/run/docker.sock access (like Traefik). Harden in prod
-# with a read-only docker-socket-proxy instead of mounting the socket directly.
+# Runs as root for /var/run/docker.sock access. Harden in prod with a read-only
+# docker-socket-proxy instead of mounting the socket directly.
 ENTRYPOINT ["/usr/local/bin/gobackup-docker"]

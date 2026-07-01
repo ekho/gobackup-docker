@@ -1,6 +1,6 @@
 # gobackup-docker
 
-A Traefik-style supervisor for [gobackup](https://github.com/gobackup/gobackup): it watches Docker containers, reads
+A label-driven supervisor for [gobackup](https://github.com/gobackup/gobackup): it watches Docker containers, reads
 `gobackup.*` labels, generates a gobackup config, and lets gobackup hot-reload it — so backups are configured by labels
 instead of hand-editing `gobackup.yml`.
 

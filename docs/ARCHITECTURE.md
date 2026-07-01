@@ -2,7 +2,7 @@
 
 **Статус:** research + Phase-0 спайк done → **Вариант B подтверждён** · **Дата:** 2026-07-01
 
-Цель: обёртка вокруг [gobackup](https://github.com/gobackup/gobackup), которая по аналогии с Traefik
+Цель: обёртка вокруг [gobackup](https://github.com/gobackup/gobackup), которая
 следит за Docker-контейнерами, читает лейблы `gobackup.*`, генерирует конфиг gobackup и заставляет
 gobackup применить его — без ручного редактирования `gobackup.yml`.
 
@@ -85,19 +85,19 @@ Basic-auth только если заданы и `web.username`, и `web.passwor
 
 ---
 
-## 2. Паттерн Traefik, спроецированный на нас
+## 2. Паттерн label-discovery (discover → parse → generate → apply)
 
 Цикл **discover → parse-labels → generate-config → apply** в одной watcher-горутине.
 
-| Стадия Traefik | Что делает Traefik | Наш аналог |
-|---|---|---|
-| **Discover** | стартовый `ContainerList(All)` + подписка на поток `/events` (не поллинг) | так же: полный reconcile + `cli.Events(...)` |
-| **React** | реагирует на `start`/`die`/`health_status`, **полностью пересобирает конфиг** | реагируем на `start`/`die`; события только регенерируют конфиг, **бэкапы остаются по расписанию** |
-| **Reconnect** | connect→list→subscribe в exponential backoff (SDK сам не переподключается) | тот же `select` по `Messages`/`Err`/`ctx.Done()`, backoff, ре-`Events` |
-| **Channel** | пушит целый `dynamic.Message` в канал; consumer дедупит `reflect.DeepEqual` | горутина рендерит весь конфиг → канал → dedup vs last-applied → атомарная запись |
-| **Debounce** | ring-buffer-of-1 (keep-latest) + throttle (по умолчанию ~2s) | свой debounce: `docker compose up` со шквалом `start` схлопнуть в одну регенерацию |
-| **Opt-in** | `traefik.enable=true` + `exposedByDefault` + `constraints` | `gobackup.enable=true` + глобальный default + `gobackup.instance=<id>` scope |
-| **Label decode** | `paerser`: dotted keys → дерево структур | у нас — dotted keys → `map[string]any` → `yaml.v3` (свой декодер, paerser избыточен) |
+| Стадия | Как делаем |
+|---|---|
+| **Discover** | стартовый `ContainerList(All)` + подписка на поток `/events` (не поллинг) |
+| **React** | реагируем на `start`/`die`, **полностью пересобираем конфиг**; события только регенерируют конфиг, **бэкапы остаются по расписанию** |
+| **Reconnect** | connect→list→subscribe в exponential backoff (SDK сам не переподключается): `select` по `Messages`/`Err`/`ctx.Done()`, ре-`Events` |
+| **Channel** | горутина рендерит весь конфиг → канал → dedup vs last-applied (`reflect.DeepEqual`) → атомарная запись |
+| **Debounce** | ring-buffer-of-1 (keep-latest) + таймер: `docker compose up` со шквалом `start` схлопывается в одну регенерацию |
+| **Opt-in** | `gobackup.enable=true` + глобальный `exposedByDefault` default + `gobackup.instance=<id>` scope |
+| **Label decode** | dotted keys → `map[string]any` → `yaml.v3` (свой декодер) |
 
 **Docker SDK:** классический `github.com/docker/docker/client` (пин, напр. `v28.x`, с `WithAPIVersionNegotiation()`;
 **не** мешать с новым source-incompatible `github.com/moby/moby/client`).
@@ -158,7 +158,7 @@ fsnotify-поверх-volume.
 
 ## 5. Схема лейблов + DRY-механизм (Global Defaults Profile)
 
-Двухуровневая модель, как static+dynamic у Traefik. **DRY решается не якорями в лейблах** (лейблы плоские, якорей между
+Двухуровневая модель: static-конфиг супервизора + dynamic-лейблы контейнеров. **DRY решается не якорями в лейблах** (лейблы плоские, якорей между
 ними нет), а **наследованием от общего профиля**, который живёт в static-конфиге супервизора. Итог DRY-выигрыша сильнее
 YAML-anchors: контейнеру нужны **только `gobackup.enable` + его `databases.*`**, всё остальное (storages, notifiers,
 schedule, compress, retention, path) наследуется и не повторяется ни на одном контейнере.
@@ -281,6 +281,5 @@ labels:
 ## 7. Источники
 - gobackup: `main.go`, `config/config.go`, `scheduler/scheduler.go`, `model/model.go`, `web/api.go`, `storage/cycler.go`
   — github.com/gobackup/gobackup
-- Traefik Docker provider: `pkg/provider/docker/pdocker.go` — github.com/traefik/traefik
-- Docker SDK: pkg.go.dev/github.com/docker/docker/client
+- Docker SDK: pkg.go.dev/github.com/docker/docker/client (events stream, container list/inspect)
 - Prior art: offen/docker-volume-backup
