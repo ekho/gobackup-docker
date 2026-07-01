@@ -65,10 +65,9 @@ gobackup-docker/
    поток `Events(ctx, {type=container, event=start|die})`; `select` по `Messages`/`Err`/`ctx.Done()`;
    exponential backoff + ре-`Events` при разрыве; `Since` для реплея пропущенных событий.
    Читаем лейблы из `msg.Actor.Attributes` (без inspect, где хватает); `ContainerInspect` для `Mounts[]` при файловых бэкапах.
-3. **`labels/parse.go`** — из плоской `map[string]string` вытащить `gobackup.*`; гейт `enable` (+ глобальный
-   `exposedByDefault`); scope по `gobackup.instance`; `gobackup.profile`; dotted-ключи `gobackup.model.<name>.<path>` →
-   вложенный `map[string]any`; распознать sentinel `"!none"`; мягкий парсинг булевых. **Декодер stateless** — не знает про
-   содержимое `defaults.yml` (иначе связывает парсер со static-стейтом).
+3. **`labels/parse.go`** — из плоской `map[string]string` вытащить `gobackup.*` (одна модель на контейнер); мета-ключи
+   `enable`/`name`/`instance`/`profile`; остальные `gobackup.<config.path>` → вложенный `map[string]any`; sentinel `"!none"`;
+   мягкий bool. **Декодер stateless** — не знает про `defaults.yml`.
 4. **`render/`** — DRY-механизм (см. ARCHITECTURE §5): `profiles.go` грузит `defaults.yml`; `model.go` deep-merge'ит
    профиль (низ) + лейблы (верх) + применяет opt-out `"!none"` как удаление поддерева; префиксование имён
    (`<container|instance>-<model>`); `render.go` — проход `text/template` (`{{ .Model }}` и т.п.) по слитому дереву,

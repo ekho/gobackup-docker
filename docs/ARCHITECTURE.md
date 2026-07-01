@@ -199,50 +199,55 @@ default:                              # имя профиля (профиль п
 ```
 
 ### 5.2 Лейблы контейнера — минимальная поверхность
-Контейнер nextcloud (эквивалент вашего `models.nextcloud`) целиком:
+**Одна модель на контейнер**, грамматика плоская: `gobackup.<config.path>` кладётся прямо в тело модели (без уровня
+`.model.<M>.`). Контейнер nextcloud (эквивалент вашего `models.mynextcloud`) целиком:
 ```yaml
 labels:
   gobackup.enable: "true"
-  gobackup.model.nextcloud.databases.nextcloud.type: "postgresql"
-  gobackup.model.nextcloud.databases.nextcloud.host: "${NEXTCLOUD_POSTGRESQL_HOST}"
-  gobackup.model.nextcloud.databases.nextcloud.port: "${NEXTCLOUD_POSTGRESQL_PORT}"
-  gobackup.model.nextcloud.databases.nextcloud.database: "${NEXTCLOUD_POSTGRESQL_DATABASE}"
-  gobackup.model.nextcloud.databases.nextcloud.username: "${NEXTCLOUD_POSTGRESQL_USERNAME}"
-  gobackup.model.nextcloud.databases.nextcloud.password: "${NEXTCLOUD_POSTGRESQL_PASSWORD}"
-  gobackup.model.nextcloud.databases.nextcloud.args: "--if-exists --clean --no-owner"
+  gobackup.name: "mynextcloud"                                   # имя модели (опц.; иначе <container>-<host>)
+  gobackup.databases.nextcloud.type: "postgresql"
+  gobackup.databases.nextcloud.host: "${NEXTCLOUD_POSTGRESQL_HOST}"
+  gobackup.databases.nextcloud.database: "${NEXTCLOUD_POSTGRESQL_DATABASE}"
+  gobackup.databases.nextcloud.password: "${NEXTCLOUD_POSTGRESQL_PASSWORD}"
+  gobackup.databases.nextcloud.args: "--if-exists --clean --no-owner"
+  gobackup.archive.includes: "/var/www/html/data"               # БД и файлы могут жить в одной модели
 ```
-Супервизор deep-merge'ит `default` под модель `nextcloud`, разворачивает `{{ .Model }}` → `nextcloud`, и эмитит ровно ваш
-исходный `models.nextcloud` (schedule, compress_with, default_storage, оба storage с `path: /backups/nextcloud`, notifiers)
-с `databases.nextcloud` из лейблов. Второе приложение (gitea) — только свои `databases.*`, и автоматически получает
-`/backups/gitea` в обоих хранилищах. **Все значения лейблов — в кавычках** (Compose коэрсит `true/no/on`), булевы парсим мягко.
+Супервизор deep-merge'ит профиль `default` под модель, разворачивает `{{ .Model }}` → `mynextcloud`, и эмитит
+`models.mynextcloud` (schedule, compress_with, default_storage, оба storage с `path: /backups/mynextcloud`, notifiers) +
+`databases`/`archive` из лейблов. Без `gobackup.name` имя = `<имя_контейнера>-<docker_host>` (напр. `gitea-orbstack`).
+**Все значения лейблов — в кавычках** (Compose коэрсит `true/no/on`), булевы парсим мягко.
 
 ### 5.3 Грамматика лейблов
+Зарезервированы четыре мета-ключа `gobackup.<key>`; всё остальное `gobackup.<путь>` идёт в тело модели.
 | Лейбл | Значение |
 |---|---|
 | `gobackup.enable` | гейт включения (мягкий bool) + глобальный `exposedByDefault` |
+| `gobackup.name` | имя модели (ключ в `models:` и `{{ .Model }}`); по умолчанию `<container>-<host>` |
 | `gobackup.instance` | scope: контейнером управляет супервизор с совпадающим `GOBACKUP_DOCKER_INSTANCE` |
 | `gobackup.profile` | какой профиль из `defaults.yml` взять базой (по умолчанию `default`) |
-| `gobackup.model.<M>.databases.<id>.<key>` | единственное реально пер-workload — обычно единственные нужные лейблы |
-| `gobackup.model.<M>.<dotted.path>` | переопределить одно унаследованное значение (напр. `storages.yc-object-storage.keep: "90"`, `schedule.cron`) — deep-merge поверх профиля |
-| `gobackup.model.<M>.<subtree>: "!none"` | opt-out от унаследованного поддерева: `notifiers: "!none"` (заглушить модель), `storages.local_disk: "!none"` (убрать одно хранилище) |
+| `gobackup.<config.path>` | тело модели: `databases.<id>.<key>`, `archive.includes`, `storages.<id>.<key>`, `schedule.cron`, … (deep-merge поверх профиля) |
+| `gobackup.<subtree>: "!none"` | opt-out от унаследованного поддерева: `notifiers: "!none"`, `storages.local_disk: "!none"` |
 
-Пример модели с оверрайдом и opt-out (gitea: хранить 90 копий, без уведомлений):
+Хост-суффикс для авто-имени = hostname демона (`docker info` → `Name`), override — env `GOBACKUP_DOCKER_HOST_ID`.
+
+Пример с авто-именем, оверрайдом и opt-out (gitea → модель `gitea-<host>`, 90 копий, без уведомлений):
 ```yaml
-  gobackup.model.gitea.databases.gitea.type: "postgresql"
-  gobackup.model.gitea.databases.gitea.host: "${GITEA_DB_HOST}"
-  gobackup.model.gitea.storages.yc-object-storage.keep: "90"   # override
-  gobackup.model.gitea.notifiers: "!none"                       # opt-out
+  gobackup.enable: "true"
+  gobackup.databases.gitea.type: "postgresql"
+  gobackup.databases.gitea.host: "${GITEA_DB_HOST}"
+  gobackup.storages.yc-object-storage.keep: "90"   # override
+  gobackup.notifiers: "!none"                       # opt-out
 ```
 
 ### 5.4 Порядок слияния (низ → верх)
 1. встроенные дефолты gobackup (tar, web enabled, keep=0…) — только где ниже ничего не задано;
 2. тело профиля из `defaults.yml` (`default` или указанный `gobackup.profile`);
-3. лейблы `gobackup.model.<M>.<path>` — **deep-merge, выигрывают по ключу**;
+3. лейблы `gobackup.<config.path>` — **deep-merge, выигрывают по ключу**;
 4. sentinel `"!none"` — применяется последним, **удаляет** названное поддерево (что бы профиль/сосед ни задал);
 5. разворот шаблонов `{{ .Model }}` — рендер-проход по уже слитому дереву (не источник значений).
 
 ### 5.5 Плейсхолдеры (почему НЕ `${...}`)
-Токены Go `text/template` (`{{ .Model }}`, также `{{ .Container }}`, `{{ .Instance }}`) разворачивает **супервизор до
+Токены Go `text/template` (`{{ .Model }}`, также `{{ .Container }}`, `{{ .Host }}`, `{{ .Instance }}`) разворачивает **супервизор до
 записи файла**. Нельзя использовать `${MODEL}`: gobackup гоняет `os.ExpandEnv` по файлу и превратит `${MODEL}` в пустоту
 (сочтёт незаданной env). Разделение по **синтаксису И времени**: `{{...}}` съедает супервизор, `${VAR}` (секреты) доходят
 до gobackup нетронутыми. `path_template` настраивается в профиле, если нужен не `/backups/<model>`.

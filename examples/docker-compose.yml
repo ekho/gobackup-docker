@@ -1,0 +1,61 @@
+# Example: gobackup-docker (supervisor) + stock gobackup, Option B.
+# The supervisor watches gobackup.* labels and writes /etc/gobackup/gobackup.yml
+# onto a shared volume; gobackup hot-reloads it. Shared storages/notifiers live
+# once in defaults.yml (see examples/defaults.yml); containers add only their DB.
+name: myproject
+
+volumes:
+  gobackup-config:   # shared: supervisor writes, gobackup reads
+  gobackup-state:    # gobackup ~/.gobackup: retention (cycler) state survives restarts
+
+services:
+  gobackup-docker:
+    build: ..                       # or image: ghcr.io/ekho/gobackup-docker
+    environment:
+      GOBACKUP_DOCKER_OUTPUT: /etc/gobackup/gobackup.yml
+      GOBACKUP_DOCKER_DEFAULTS: /etc/gobackup-docker/defaults.yml
+      # GOBACKUP_DOCKER_HOST_ID: prod-db-1   # override auto host suffix
+      # GOBACKUP_DOCKER_INSTANCE: prod       # scope which containers this manages
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro   # discovery (consider a socket-proxy)
+      - ./defaults.yml:/etc/gobackup-docker/defaults.yml:ro
+      - gobackup-config:/etc/gobackup
+
+  gobackup:
+    image: huacnlee/gobackup:latest
+    command: ["/usr/local/bin/gobackup", "run", "-c", "/etc/gobackup/gobackup.yml"]
+    environment:
+      # secrets referenced as ${VAR} in defaults.yml / labels, expanded by gobackup:
+      YC_OS_ACCESS_KEY: ${YC_OS_ACCESS_KEY}
+      YC_OS_SECRET_KEY: ${YC_OS_SECRET_KEY}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+    volumes:
+      - gobackup-config:/etc/gobackup
+      - gobackup-state:/root/.gobackup
+    networks: [backup_net]
+
+  nextcloud:
+    image: nextcloud:latest
+    networks: [backup_net]
+    labels:
+      gobackup.enable: "true"
+      gobackup.name: "mynextcloud"          # explicit model name (optional)
+      gobackup.databases.nextcloud.type: "postgresql"
+      gobackup.databases.nextcloud.host: "${NEXTCLOUD_POSTGRESQL_HOST}"
+      gobackup.databases.nextcloud.database: "${NEXTCLOUD_POSTGRESQL_DATABASE}"
+      gobackup.databases.nextcloud.username: "${NEXTCLOUD_POSTGRESQL_USERNAME}"
+      gobackup.databases.nextcloud.password: "${NEXTCLOUD_POSTGRESQL_PASSWORD}"
+      gobackup.databases.nextcloud.args: "--if-exists --clean --no-owner"
+
+  gitea:
+    image: gitea/gitea:latest
+    networks: [backup_net]
+    labels:
+      gobackup.enable: "true"                # no gobackup.name → model "gitea-<host>"
+      gobackup.databases.gitea.type: "postgresql"
+      gobackup.databases.gitea.host: "${GITEA_DB_HOST}"
+      gobackup.storages.yc-object-storage.keep: "90"   # override just this key
+      gobackup.notifiers: "!none"                       # opt out of inherited notifiers
+
+networks:
+  backup_net:

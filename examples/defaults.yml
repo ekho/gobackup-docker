@@ -1,0 +1,33 @@
+# Supervisor static config (GOBACKUP_DOCKER_DEFAULTS). Read only by the
+# supervisor, never by gobackup. Anchors/merge-keys are allowed here — yaml.v3
+# resolves them at parse time. ${VAR} stays literal (gobackup expands it).
+#
+# Every discovered container inherits the "default" profile unless its
+# gobackup.profile label selects another. Containers only need to add their
+# databases.* (and any overrides), so storages/notifiers/schedule appear ONCE here.
+
+default:
+  schedule:
+    cron: "0 1 * * *"
+  compress_with:
+    type: tgz
+  default_storage: yc-object-storage
+  storages:
+    local_disk:
+      type: local
+      keep: 10
+      path: /backups/{{ .Model }}
+    yc-object-storage:
+      type: s3
+      bucket: media.kd
+      region: ru-central1
+      endpoint: https://storage.yandexcloud.net
+      access_key_id: ${YC_OS_ACCESS_KEY}
+      secret_access_key: ${YC_OS_SECRET_KEY}
+      keep: 10
+      path: /backups/{{ .Model }}
+  notifiers:
+    telegram:
+      type: telegram
+      chat_id: "66097481"
+      token: ${TELEGRAM_BOT_TOKEN}
