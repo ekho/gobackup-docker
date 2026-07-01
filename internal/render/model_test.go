@@ -1,0 +1,165 @@
+package render
+
+import (
+	"testing"
+
+	"github.com/ekho/gobackup-docker/internal/labels"
+)
+
+func TestModelName(t *testing.T) {
+	tests := []struct {
+		container, custom, host, want string
+	}{
+		{"gitea", "", "h1", "gitea-h1"},           // auto: container-host
+		{"gitea", "mymodel", "h1", "mymodel"},     // explicit name wins, host ignored
+		{"gitea", "", "", "gitea"},                // no host: just container
+		{"gitea", "mymodel", "", "mymodel"},       // explicit name, no host
+	}
+	for _, tt := range tests {
+		if got := ModelName(tt.container, tt.custom, tt.host); got != tt.want {
+			t.Errorf("ModelName(%q,%q,%q) = %q, want %q", tt.container, tt.custom, tt.host, got, tt.want)
+		}
+	}
+}
+
+func TestValidateModel(t *testing.T) {
+	tests := []struct {
+		name    string
+		model   map[string]any
+		wantErr bool
+	}{
+		{"no storages", map[string]any{"databases": map[string]any{"d": map[string]any{}}}, true},
+		{"storages but no db/archive", map[string]any{"storages": map[string]any{"s": map[string]any{}}}, true},
+		{"storages + databases", map[string]any{"storages": map[string]any{"s": map[string]any{}}, "databases": map[string]any{"d": map[string]any{}}}, false},
+		{"storages + archive", map[string]any{"storages": map[string]any{"s": map[string]any{}}, "archive": map[string]any{}}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateModel(tt.model)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateModel err=%v, wantErr=%v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func profilesFixture() Profiles {
+	return Profiles{
+		"default": {
+			"schedule":        map[string]any{"cron": "0 1 * * *"},
+			"default_storage": "s3",
+			"storages": map[string]any{
+				"local": map[string]any{"type": "local", "keep": 10, "path": "/b/{{ .Model }}"},
+				"s3":    map[string]any{"type": "s3", "keep": 10, "path": "/b/{{ .Model }}"},
+			},
+			"notifiers": map[string]any{"tg": map[string]any{"type": "telegram"}},
+		},
+	}
+}
+
+func TestBuild_inheritOverrideOptoutTemplate(t *testing.T) {
+	src := Source{
+		Container: "gitea",
+		Model: map[string]any{
+			"databases": map[string]any{"gitea": map[string]any{"type": "postgresql"}},
+			"storages":  map[string]any{"s3": map[string]any{"keep": "90"}}, // override just keep
+			"notifiers": labels.OptOut,                                      // opt out inherited notifiers
+		},
+	}
+	cfg := Build([]Source{src}, profilesFixture(), "h1", "")
+	models := cfg["models"].(map[string]any)
+
+	m, ok := models["gitea-h1"].(map[string]any)
+	if !ok {
+		t.Fatalf("model gitea-h1 missing; models=%#v", models)
+	}
+	if _, hasNotifiers := m["notifiers"]; hasNotifiers {
+		t.Error("notifiers should have been opted out")
+	}
+	s3 := m["storages"].(map[string]any)["s3"].(map[string]any)
+	if s3["keep"] != "90" || s3["type"] != "s3" { // override applied, type inherited
+		t.Errorf("s3 = %#v", s3)
+	}
+	local := m["storages"].(map[string]any)["local"].(map[string]any)
+	if local["keep"] != 10 { // untouched inherited value keeps its int type
+		t.Errorf("local.keep = %#v, want int 10", local["keep"])
+	}
+	if local["path"] != "/b/gitea-h1" { // template expanded with final name
+		t.Errorf("local.path = %q", local["path"])
+	}
+}
+
+func TestBuild_profileIsolation(t *testing.T) {
+	// Two containers inherit the same profile; an override on one must not bleed
+	// into the other (regression guard for deepCopy in Build).
+	profiles := profilesFixture()
+	srcs := []Source{
+		{Container: "a", Model: map[string]any{"databases": map[string]any{"d": map[string]any{"type": "x"}}, "storages": map[string]any{"s3": map[string]any{"keep": "999"}}}},
+		{Container: "b", Model: map[string]any{"databases": map[string]any{"d": map[string]any{"type": "x"}}}},
+	}
+	models := Build(srcs, profiles, "h", "")["models"].(map[string]any)
+	bS3 := models["b-h"].(map[string]any)["storages"].(map[string]any)["s3"].(map[string]any)
+	if bS3["keep"] != 10 {
+		t.Errorf("profile leaked: b.s3.keep = %#v, want int 10", bS3["keep"])
+	}
+	// And the profile fixture itself must be pristine.
+	if profiles["default"]["storages"].(map[string]any)["s3"].(map[string]any)["keep"] != 10 {
+		t.Error("Build mutated the shared profile")
+	}
+}
+
+func TestBuild_skips(t *testing.T) {
+	profiles := profilesFixture()
+	srcs := []Source{
+		{Container: "known", Model: map[string]any{"databases": map[string]any{"d": map[string]any{"type": "x"}}}},
+		{Container: "badprofile", Profile: "nope", Model: map[string]any{"databases": map[string]any{"d": map[string]any{"type": "x"}}}},
+		// label-only (no default lookup issue) but invalid: no storages, no db/archive
+		{Container: "invalid", Profile: "", Model: map[string]any{"compress_with": map[string]any{"type": "tgz"}}},
+	}
+	// Give the invalid one an empty base by using a profile set without "default".
+	models := Build(srcs, profiles, "h", "")["models"].(map[string]any)
+
+	if _, ok := models["known-h"]; !ok {
+		t.Error("valid model 'known-h' should be present")
+	}
+	if _, ok := models["badprofile-h"]; ok {
+		t.Error("model with unknown profile must be skipped")
+	}
+}
+
+func TestBuild_collision(t *testing.T) {
+	// Same explicit name from two containers → second skipped, first kept.
+	profiles := profilesFixture()
+	srcs := []Source{
+		{Container: "c1", Name: "dup", Model: map[string]any{"databases": map[string]any{"d": map[string]any{"type": "a"}}}},
+		{Container: "c2", Name: "dup", Model: map[string]any{"databases": map[string]any{"d": map[string]any{"type": "b"}}}},
+	}
+	models := Build(srcs, profiles, "h", "")["models"].(map[string]any)
+	if len(models) != 1 {
+		t.Fatalf("expected 1 model after collision, got %d: %#v", len(models), models)
+	}
+	dup := models["dup"].(map[string]any)["databases"].(map[string]any)["d"].(map[string]any)
+	if dup["type"] != "a" {
+		t.Errorf("first writer should win, got type=%v", dup["type"])
+	}
+}
+
+func TestBuild_labelOnlyNoDefault(t *testing.T) {
+	// No profiles at all + no explicit profile => empty base (label-only). A fully
+	// self-described model must still build.
+	src := Source{
+		Container: "solo",
+		Model: map[string]any{
+			"databases": map[string]any{"d": map[string]any{"type": "postgresql"}},
+			"storages":  map[string]any{"local": map[string]any{"type": "local", "path": "/b/{{ .Model }}"}},
+		},
+	}
+	models := Build([]Source{src}, Profiles{}, "h", "")["models"].(map[string]any)
+	m, ok := models["solo-h"].(map[string]any)
+	if !ok {
+		t.Fatalf("label-only model missing; models=%#v", models)
+	}
+	if got := m["storages"].(map[string]any)["local"].(map[string]any)["path"]; got != "/b/solo-h" {
+		t.Errorf("path = %q", got)
+	}
+}
