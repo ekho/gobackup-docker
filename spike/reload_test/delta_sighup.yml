@@ -1,0 +1,16 @@
+web:
+  enabled: true
+  host: 0.0.0.0
+  port: 2703
+models:
+  delta_sighup:
+    schedule:
+      cron: "0 8 * * *"
+    archive:
+      includes:
+        - /tmp
+    storages:
+      local:
+        type: local
+        path: /tmp/backups
+        keep: 2
