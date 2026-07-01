@@ -10,10 +10,10 @@ func TestModelName(t *testing.T) {
 	tests := []struct {
 		container, custom, host, want string
 	}{
-		{"gitea", "", "h1", "gitea-h1"},           // auto: container-host
-		{"gitea", "mymodel", "h1", "mymodel"},     // explicit name wins, host ignored
-		{"gitea", "", "", "gitea"},                // no host: just container
-		{"gitea", "mymodel", "", "mymodel"},       // explicit name, no host
+		{"gitea", "", "h1", "gitea-h1"},       // auto: container-host
+		{"gitea", "mymodel", "h1", "mymodel"}, // explicit name wins, host ignored
+		{"gitea", "", "", "gitea"},            // no host: just container
+		{"gitea", "mymodel", "", "mymodel"},   // explicit name, no host
 	}
 	for _, tt := range tests {
 		if got := ModelName(tt.container, tt.custom, tt.host); got != tt.want {

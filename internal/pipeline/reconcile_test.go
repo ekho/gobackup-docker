@@ -69,9 +69,9 @@ func TestReconcile_gatingAndRender(t *testing.T) {
 
 	lister := &fakeLister{containers: []docker.Container{
 		{ID: "1", Name: "pg", Labels: map[string]string{
-			"gobackup.enable":               "true",
-			"gobackup.databases.main.type":  "postgresql",
-			"gobackup.databases.main.host":  "pg",
+			"gobackup.enable":              "true",
+			"gobackup.databases.main.type": "postgresql",
+			"gobackup.databases.main.host": "pg",
 		}},
 		{ID: "2", Name: "off", Labels: map[string]string{"gobackup.enable": "false",
 			"gobackup.databases.x.type": "mysql"}},

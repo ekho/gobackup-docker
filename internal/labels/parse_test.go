@@ -86,16 +86,16 @@ func TestParse_meta(t *testing.T) {
 
 func TestParse_modelTree(t *testing.T) {
 	labels := map[string]string{
-		"gobackup.enable":                 "true",
-		"gobackup.name":                   "should-not-appear-in-model",
-		"gobackup.databases.nc.type":      "postgresql",
-		"gobackup.databases.nc.host":      "${NC_HOST}",
-		"gobackup.databases.nc.args":      "--clean",
-		"gobackup.archive.includes":       "/data",
-		"gobackup.storages.s3.keep":       "90",
-		"gobackup.notifiers":              OptOut, // subtree opt-out kept as sentinel string
-		"unrelated.label":                 "ignored",
-		"com.docker.compose.project":      "ignored",
+		"gobackup.enable":            "true",
+		"gobackup.name":              "should-not-appear-in-model",
+		"gobackup.databases.nc.type": "postgresql",
+		"gobackup.databases.nc.host": "${NC_HOST}",
+		"gobackup.databases.nc.args": "--clean",
+		"gobackup.archive.includes":  "/data",
+		"gobackup.storages.s3.keep":  "90",
+		"gobackup.notifiers":         OptOut, // subtree opt-out kept as sentinel string
+		"unrelated.label":            "ignored",
+		"com.docker.compose.project": "ignored",
 	}
 	got := Parse(labels, false)
 
