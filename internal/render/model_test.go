@@ -77,7 +77,7 @@ func TestBuild_inheritOverrideOptoutTemplate(t *testing.T) {
 		t.Error("notifiers should have been opted out")
 	}
 	s3 := m["storages"].(map[string]any)["s3"].(map[string]any)
-	if s3["keep"] != "90" || s3["type"] != "s3" { // override applied, type inherited
+	if s3["keep"] != 90 || s3["type"] != "s3" { // override applied (coerced to int), type inherited
 		t.Errorf("s3 = %#v", s3)
 	}
 	local := m["storages"].(map[string]any)["local"].(map[string]any)

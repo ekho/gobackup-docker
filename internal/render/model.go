@@ -67,7 +67,7 @@ func Build(sources []Source, profiles Profiles, hostID, instance string) map[str
 			log.Printf("[render] model %q: template error: %v; skipping", name, err)
 			continue
 		}
-		m := expanded.(map[string]any)
+		m := coerceTree(expanded).(map[string]any)
 
 		if err := validateModel(m); err != nil {
 			log.Printf("[render] model %q invalid: %v; skipping", name, err)

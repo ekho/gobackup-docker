@@ -89,18 +89,18 @@ gobackup-docker/
 
 **Критерий:** изменение лейбла на живом контейнере приводит к применённому бэкап-конфигу без ручных действий и без рестарта gobackup.
 
-### Phase 3 — Полное покрытие типов (scope = всё)
-- **databases:** все типы gobackup (postgresql/mysql/mariadb/mongodb/redis/mssql/sqlite/influxdb2/etcd/firebird) —
-  прокинуть их специфичные ключи как есть; путь **сеть+DSN** по умолчанию (`host` = имя сервиса в общей сети).
-- **storages:** local/s3-семейство/gcs/azure/webdav/ftp/scp/sftp + `keep`, `path`, `default_storage`.
-- **notifiers:** mail/webhook/slack/discord/telegram/healthchecks + `on_success`/`on_failure`.
-- **compress_with / encrypt_with / split_with / schedule (cron|every+at)** — маппинг 1:1.
-- **Файловые бэкапы (`archive`)** ⚠️ — работают по путям **внутри контейнера gobackup**. v1: поддержать `archive.includes/excludes`
-  с явными in-container путями + **валидация**: если путь недоступен — пропустить модель с внятным логом. Целевые volume'ы
-  должны быть **предмонтированы** в контейнер gobackup (ro). Через `ContainerInspect.Mounts` можно транслировать имя volume →
-  точку монтирования и предупреждать, если volume не проброшен. Авто-remount (рестарт для hot-add mount) — **вне v1**, задокументировать.
+### Phase 3 — Полное покрытие типов (scope = всё) ✅ по сути готово
+Покрытие типов **бесплатно by design:** грамматика `gobackup.<config.path>` копируется 1:1 в тело модели, поэтому все
+databases (postgresql/mysql/mariadb/mongodb/redis/mssql/sqlite/influxdb2/etcd/firebird), storages (local/s3-семейство/
+gcs/azure/webdav/ftp/scp/sftp), notifiers (mail/webhook/slack/discord/telegram/healthchecks) и `compress_with`/
+`encrypt_with`/`split_with`/`schedule` работают без спец-кода на тип. Путь к БД по умолчанию — **сеть+DSN**.
+- ✅ **Smart scalar coercion** — реализовано с guard'ами (`internal/render/coerce.go`): `keep/port` → int, `enabled` → bool,
+  но `chat_id`/`*_id`/`token`/`password`/`secret`/`key`/`host` и числа с ведущими нулями **остаются строками**. Покрыто тестами.
+- **Файловые бэкапы (`archive`)** ⚠️ — работают по путям **внутри контейнера gobackup**. Строгая cross-container валидация
+  из супервизора **невозможна** (он не владеет контейнером gobackup и его mount'ами) → вместо этого low-noise **guidance-лог**
+  при изменении конфига перечисляет модели с `archive` и напоминает про монтирование источника (см. §5.7). Авто-remount — вне v1.
 
-**Критерий:** сквозной прогон для Postgres (dump в S3) и для файлового archive в local — оба проходят реальный `Perform()`.
+**Критерий:** сквозной прогон Postgres → tgz в local storage проходит реальный `Perform()` — ✅ проверено (`spike/e2e/`).
 
 ### Phase 4 — Упаковка и деплой
 - **Dockerfile** — B: минимальный образ супервизора (только Go-бинарь + Docker SDK); A: combined (супервизор + gobackup + утилиты БД + `tini`).

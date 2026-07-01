@@ -6,6 +6,7 @@ package pipeline
 import (
 	"context"
 	"log"
+	"sort"
 	"time"
 
 	"github.com/ekho/gobackup-docker/internal/apply"
@@ -103,6 +104,24 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 	models, _ := cfg["models"].(map[string]any)
 	if changed {
 		log.Printf("[reconcile] wrote %s: %d model(s) from %d container(s)", r.writer.Path, len(models), len(sources))
+		// File archives tar the gobackup container's own filesystem, not the
+		// labeled container's — remind the operator to mount the source paths.
+		if a := modelsWithArchive(models); len(a) > 0 {
+			log.Printf("[reconcile] note: models %v use file archive — ensure their include paths are mounted into the gobackup container", a)
+		}
 	}
 	return nil
+}
+
+func modelsWithArchive(models map[string]any) []string {
+	var names []string
+	for name, m := range models {
+		if mm, ok := m.(map[string]any); ok {
+			if _, has := mm["archive"]; has {
+				names = append(names, name)
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
 }
