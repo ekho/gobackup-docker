@@ -26,10 +26,10 @@ jobs:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: Build and push (linux/amd64)
+      - name: Set up buildx (container driver for multi-platform)
+        run: docker buildx create --use --name multiarch --driver docker-container
+      - name: Build and push (linux/amd64, linux/arm64)
         run: |
           image=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')  # GHCR requires lowercase
-          docker build -t "$image:$REF_TAG" -t "$image:latest" .
-          docker push "$image:$REF_TAG"
-          docker push "$image:latest"
-      # Multi-arch (linux/arm64) needs buildx + QEMU; add if arm hosts are targeted.
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            -t "$image:$REF_TAG" -t "$image:latest" --push .
