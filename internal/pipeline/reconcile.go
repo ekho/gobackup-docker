@@ -25,15 +25,20 @@ type Config struct {
 	Debounce         time.Duration // collapse event bursts
 }
 
+// Lister enumerates candidate containers. Satisfied by *docker.Client; faked in tests.
+type Lister interface {
+	List(ctx context.Context) ([]docker.Container, error)
+}
+
 // Reconciler regenerates the gobackup config on demand.
 type Reconciler struct {
 	cfg    Config
-	docker *docker.Client
+	lister Lister
 	writer *apply.FileWriter
 }
 
-func NewReconciler(cfg Config, dc *docker.Client, w *apply.FileWriter) *Reconciler {
-	return &Reconciler{cfg: cfg, docker: dc, writer: w}
+func NewReconciler(cfg Config, lister Lister, w *apply.FileWriter) *Reconciler {
+	return &Reconciler{cfg: cfg, lister: lister, writer: w}
 }
 
 // Run drives the debounced loop until ctx is cancelled. fire() (passed to the
@@ -61,7 +66,7 @@ func (r *Reconciler) Run(ctx context.Context, trigger <-chan struct{}) {
 // reconcile does one full pass: list → parse+gate → render → apply. Any error
 // returns without applying, so the previously written config stays in place.
 func (r *Reconciler) reconcile(ctx context.Context) error {
-	containers, err := r.docker.List(ctx)
+	containers, err := r.lister.List(ctx)
 	if err != nil {
 		return err
 	}
