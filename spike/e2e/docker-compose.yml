@@ -1,0 +1,49 @@
+# End-to-end: label-driven Postgres backup, no hand-written gobackup.yml.
+# postgres (labeled) → supervisor renders config → stock gobackup dumps it.
+name: gbde2e
+
+volumes:
+  cfg:      # shared config: supervisor writes, gobackup reads
+  backups:  # gobackup local storage output (we inspect this)
+
+networks:
+  bknet:
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: appdb
+    networks: [bknet]
+    labels:
+      gobackup.enable: "true"
+      gobackup.name: "pgtest"
+      gobackup.databases.main.type: "postgresql"
+      gobackup.databases.main.host: "postgres"
+      gobackup.databases.main.port: "5432"
+      gobackup.databases.main.database: "appdb"
+      gobackup.databases.main.username: "postgres"
+      # $$ → literal ${...} in the label so gobackup (not compose) expands it:
+      gobackup.databases.main.password: "$${POSTGRES_PASSWORD}"
+
+  gobackup-docker:
+    image: gobackup-docker:dev
+    environment:
+      GOBACKUP_DOCKER_OUTPUT: /etc/gobackup/gobackup.yml
+      GOBACKUP_DOCKER_DEFAULTS: /etc/gobackup-docker/defaults.yml
+      GOBACKUP_DOCKER_DEBOUNCE: 300ms
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./defaults.yml:/etc/gobackup-docker/defaults.yml:ro
+      - cfg:/etc/gobackup
+
+  gobackup:
+    image: huacnlee/gobackup:latest
+    command: ["/usr/local/bin/gobackup", "run", "-c", "/etc/gobackup/gobackup.yml"]
+    environment:
+      POSTGRES_PASSWORD: secret   # the ${POSTGRES_PASSWORD} gobackup expands
+    volumes:
+      - cfg:/etc/gobackup
+      - backups:/backups
+    networks: [bknet]
