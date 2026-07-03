@@ -157,36 +157,35 @@ else is a config path that goes straight into the model body.
 
 Because Docker Compose coerces unquoted `true`/`no`/`on` into booleans, **quote every label value**.
 
-### Array-typed fields (`archive.includes` / `archive.excludes`)
+### Array-typed fields (comma-separated strings)
 
-gobackup expects `includes` and `excludes` inside an `archive` block to be YAML arrays:
-
-```yaml
-archive:
-  includes:
-    - /var/www/html
-    - /etc/nginx
-  excludes:
-    - "*.log"
-    - "*.tmp"
-```
-
-Docker labels are flat strings — you cannot write a YAML list in a label value. Instead, write paths as a **comma-separated string**:
+Some gobackup config fields are YAML **arrays**, but a Docker label can only hold a flat string. For these fields you
+write a **comma-separated string** and the supervisor converts it to a proper array in the rendered `gobackup.yml`.
+Spaces around commas are trimmed; a single value becomes a one-element array; an empty value becomes an empty array.
 
 ```yaml
 labels:
-  gobackup.archive.includes:  "/var/www/html,/etc/nginx"
-  gobackup.archive.excludes:  "*.log,*.tmp"
+  gobackup.archive.includes: "/var/www/html,/etc/nginx"   # → ["/var/www/html", "/etc/nginx"]
+  gobackup.databases.pg.tables: "users,orders"            # → ["users", "orders"]
 ```
 
-The supervisor automatically converts such comma-separated strings into proper arrays in the rendered `gobackup.yml`. Single-element paths work the same way:
+The full set of array fields (this is exhaustive for gobackup — every field it reads as an array):
 
-```yaml
-labels:
-  gobackup.archive.includes:  "/var/www/html"     # → ["/var/www/html"]
-```
+| Label path | Applies to | gobackup meaning |
+|---|---|---|
+| `gobackup.archive.includes` | any model with an `archive` block | paths to back up |
+| `gobackup.archive.excludes` | ″ | paths to skip |
+| `gobackup.databases.<id>.tables` | mysql, postgresql | only these tables |
+| `gobackup.databases.<id>.exclude_tables` | mysql, postgresql, mongodb | skip these tables/collections |
+| `gobackup.databases.<id>.exclude_tables_prefix` | mongodb | skip collections with these prefixes |
+| `gobackup.databases.<id>.skip_databases` | mssql (with `all_databases: "true"`) | databases to skip |
+| `gobackup.databases.<id>.endpoints` | etcd | deprecated upstream — prefer the singular string `endpoint` |
 
-Spaces around commas are trimmed, and an empty value produces an empty array.
+> **Not arrays** (leave these as plain strings — do **not** comma-split them): `databases.<id>.args`, notifier
+> recipients `notifiers.<id>.to` (gobackup splits these itself), and `storages.<id>.credentials` (a JSON blob that
+> may contain commas). Only the paths in the table above are converted.
+
+A value that must contain a literal comma can't be expressed this way — a rare case for table names and paths.
 
 ### Model naming
 

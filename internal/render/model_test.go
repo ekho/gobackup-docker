@@ -1,10 +1,36 @@
 package render
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ekho/gobackup-docker/internal/labels"
+	"gopkg.in/yaml.v3"
 )
+
+func TestBuild_arrayFieldRendersAsYAMLSequence(t *testing.T) {
+	// End-to-end: a CSV label value at an array path must marshal to a real YAML
+	// block sequence in the generated config, not a quoted scalar gobackup would
+	// mis-split.
+	src := Source{
+		Container: "pg",
+		Model: map[string]any{
+			"databases": map[string]any{"main": map[string]any{"type": "postgresql", "tables": "users,orders"}},
+			"storages":  map[string]any{"local": map[string]any{"type": "local", "path": "/b"}},
+		},
+	}
+	out, err := yaml.Marshal(Build([]Source{src}, Profiles{}, "h", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(out)
+	if !strings.Contains(got, "- users") || !strings.Contains(got, "- orders") {
+		t.Errorf("tables did not render as a YAML sequence:\n%s", got)
+	}
+	if strings.Contains(got, "tables: users") {
+		t.Errorf("tables rendered as a scalar string:\n%s", got)
+	}
+}
 
 func TestModelName(t *testing.T) {
 	tests := []struct {
