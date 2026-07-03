@@ -144,6 +144,38 @@ func TestBuild_collision(t *testing.T) {
 	}
 }
 
+func TestBuild_archiveIncludesCommaString(t *testing.T) {
+	// archive.includes/archive.excludes as comma-separated string (from Docker label)
+	// must be coerced to a proper YAML array.
+	profiles := profilesFixture()
+	src := Source{
+		Container: "nextcloud",
+		Model: map[string]any{
+			"databases": map[string]any{"db": map[string]any{"type": "postgresql"}},
+			"archive":   map[string]any{"includes": "/var/www/html,/etc/nginx", "excludes": "*.log,*.tmp"},
+		},
+	}
+	models := Build([]Source{src}, profiles, "h1", "")["models"].(map[string]any)
+	m := models["nextcloud-h1"].(map[string]any)
+	arch := m["archive"].(map[string]any)
+
+	includes, ok := arch["includes"].([]any)
+	if !ok {
+		t.Fatalf("archive.includes is %T, want []any", arch["includes"])
+	}
+	if len(includes) != 2 || includes[0] != "/var/www/html" || includes[1] != "/etc/nginx" {
+		t.Errorf("includes = %#v, want [\"/var/www/html\", \"/etc/nginx\"]", includes)
+	}
+
+	excludes, ok := arch["excludes"].([]any)
+	if !ok {
+		t.Fatalf("archive.excludes is %T, want []any", arch["excludes"])
+	}
+	if len(excludes) != 2 || excludes[0] != "*.log" || excludes[1] != "*.tmp" {
+		t.Errorf("excludes = %#v, want [\"*.log\", \"*.tmp\"]", excludes)
+	}
+}
+
 func TestBuild_labelOnlyNoDefault(t *testing.T) {
 	// No profiles at all + no explicit profile => empty base (label-only). A fully
 	// self-described model must still build.

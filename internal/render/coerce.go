@@ -24,6 +24,7 @@ func coerceTree(v any) any {
 				coerceTree(val)
 			}
 		}
+		coerceArrayFields(t)
 		return t
 	case []any:
 		for _, val := range t {
@@ -36,6 +37,43 @@ func coerceTree(v any) any {
 	default:
 		return v
 	}
+}
+
+// archiveArrayFields lists gobackup's archive paths that must be arrays.
+var archiveArrayFields = []string{"includes", "excludes"}
+
+// coerceArrayFields converts string-valued archive array fields (includes,
+// excludes) from comma-separated strings to []any. Fields already typed as a
+// slice are left untouched.
+func coerceArrayFields(m map[string]any) {
+	arch, ok := m["archive"].(map[string]any)
+	if !ok {
+		return
+	}
+	for _, key := range archiveArrayFields {
+		s, ok := arch[key].(string)
+		if !ok {
+			continue // already an array or absent; leave it
+		}
+		arch[key] = splitCSV(s)
+	}
+}
+
+// splitCSV splits a comma-separated string, trims whitespace from each item,
+// and discards empty items. Returns an []any suitable for YAML marshalling.
+func splitCSV(s string) []any {
+	if s == "" {
+		return []any{}
+	}
+	raw := strings.Split(s, ",")
+	out := make([]any, 0, len(raw))
+	for _, item := range raw {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func coerceScalar(key, s string) any {
