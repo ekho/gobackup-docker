@@ -157,6 +157,37 @@ else is a config path that goes straight into the model body.
 
 Because Docker Compose coerces unquoted `true`/`no`/`on` into booleans, **quote every label value**.
 
+### Array-typed fields (`archive.includes` / `archive.excludes`)
+
+gobackup expects `includes` and `excludes` inside an `archive` block to be YAML arrays:
+
+```yaml
+archive:
+  includes:
+    - /var/www/html
+    - /etc/nginx
+  excludes:
+    - "*.log"
+    - "*.tmp"
+```
+
+Docker labels are flat strings — you cannot write a YAML list in a label value. Instead, write paths as a **comma-separated string**:
+
+```yaml
+labels:
+  gobackup.archive.includes:  "/var/www/html,/etc/nginx"
+  gobackup.archive.excludes:  "*.log,*.tmp"
+```
+
+The supervisor automatically converts such comma-separated strings into proper arrays in the rendered `gobackup.yml`. Single-element paths work the same way:
+
+```yaml
+labels:
+  gobackup.archive.includes:  "/var/www/html"     # → ["/var/www/html"]
+```
+
+Spaces around commas are trimmed, and an empty value produces an empty array.
+
 ### Model naming
 
 - With `gobackup.name` → used verbatim (e.g. `mynextcloud`).
@@ -362,6 +393,21 @@ internal network.
 - **File / volume backups (`gobackup.archive.includes`):** gobackup archives paths **inside its own container**, not
   the labeled container's. So the source volume must be **mounted into the gobackup container** (read-only) at the path
   you reference. Docker can't hot-add a mount to a running container, so pre-mount the volumes you intend to archive.
+
+  ```yaml
+  services:
+    gobackup:
+      volumes:
+        - nextcloud_html:/var/www/html:ro   # named volume or bind mount
+        - nextcloud_config:/etc/nginx:ro
+
+    nextcloud:
+      labels:
+        gobackup.archive.includes: "/var/www/html,/etc/nginx"
+        gobackup.archive.excludes: "*.log,*.tmp"
+  ```
+
+  See [Array-typed fields](#array-typed-fields-archiveincludes--archiveexcludes) for the label syntax.
 
 ---
 
