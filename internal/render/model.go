@@ -17,11 +17,11 @@ type TemplateData struct {
 // Source is one container's contribution: its single model body (from labels),
 // an optional explicit name, and which profile it inherits.
 type Source struct {
-	Container string // container name (primary name, e.g. "nextcloud-db")
+	Container   string // container name (primary name, e.g. "nextcloud-db")
 	ContainerID string // Docker container ID, for inspection during volume discovery
-	Name      string // gobackup.name ("" => auto)
-	Profile   string // "" => "default"
-	Model     map[string]any
+	Name        string // gobackup.name ("" => auto)
+	Profile     string // "" => "default"
+	Model       map[string]any
 }
 
 // ModelName computes the gobackup model name for a container's backup model.

@@ -20,9 +20,9 @@ const prefix = "gobackup_container."
 // empty-string / nil when the label was absent; the caller applies defaults.
 type Config struct {
 	Image    string
-	Command  string   // raw string, caller splits into []string via shell-like rules
-	Env      []string // ["FOO=bar", "BAZ=qux"] — one per gobackup_container.env.<key>
-	Networks []string // network names from comma-separated value
+	Command  string            // raw string, caller splits into []string via shell-like rules
+	Env      []string          // ["FOO=bar", "BAZ=qux"] — one per gobackup_container.env.<key>
+	Networks []string          // network names from comma-separated value
 	Labels   map[string]string // passthrough labels (under gobackup_container.labels.*)
 }
 

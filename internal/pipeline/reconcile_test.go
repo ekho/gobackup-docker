@@ -193,10 +193,12 @@ func (f *fakeContainerManager) ContainerInspect(_ context.Context, id string) (d
 func (f *fakeContainerManager) ContainerCreate(_ context.Context, _ docker.ContainerSpec) (string, error) {
 	return "new-id", nil
 }
-func (f *fakeContainerManager) ContainerStart(_ context.Context, _ string) error { return nil }
-func (f *fakeContainerManager) ContainerStop(_ context.Context, _ string, _ *int) error { return nil }
+func (f *fakeContainerManager) ContainerStart(_ context.Context, _ string) error          { return nil }
+func (f *fakeContainerManager) ContainerStop(_ context.Context, _ string, _ *int) error   { return nil }
 func (f *fakeContainerManager) ContainerRemove(_ context.Context, _ string, _ bool) error { return nil }
-func (f *fakeContainerManager) ListAll(_ context.Context) ([]docker.Container, error) { return f.all, nil }
+func (f *fakeContainerManager) ListAll(_ context.Context) ([]docker.Container, error) {
+	return f.all, nil
+}
 
 func TestReconcile_archiveVolumes(t *testing.T) {
 	defaults := writeDefaults(t, defaultsProfile)
@@ -207,12 +209,12 @@ func TestReconcile_archiveVolumes(t *testing.T) {
 			ID:   "c1",
 			Name: "app",
 			Labels: map[string]string{
-				"gobackup.enable":               "true",
-				"gobackup.name":                 "myapp",
-				"gobackup.archive.includes":     "/var/www/html,/etc/nginx",
-				"gobackup.archive.excludes":     "*.log",
-				"gobackup.databases.db.type":    "postgresql",
-				"gobackup.databases.db.host":    "app-db",
+				"gobackup.enable":            "true",
+				"gobackup.name":              "myapp",
+				"gobackup.archive.includes":  "/var/www/html,/etc/nginx",
+				"gobackup.archive.excludes":  "*.log",
+				"gobackup.databases.db.type": "postgresql",
+				"gobackup.databases.db.host": "app-db",
 			},
 		},
 	}}

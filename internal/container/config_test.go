@@ -33,9 +33,9 @@ func TestParse_networks(t *testing.T) {
 
 func TestParse_env(t *testing.T) {
 	cfg := Parse(map[string]string{
-		"gobackup_container.env.FOO":     "bar",
-		"gobackup_container.env.SECRET":  "s3cr3t",
-		"gobackup_container.networks":    "ignored", // non-env label ignored in Env
+		"gobackup_container.env.FOO":    "bar",
+		"gobackup_container.env.SECRET": "s3cr3t",
+		"gobackup_container.networks":   "ignored", // non-env label ignored in Env
 	})
 	if len(cfg.Env) != 2 {
 		t.Fatalf("expected 2 env vars, got %#v", cfg.Env)
@@ -70,7 +70,7 @@ func TestParse_absentFieldsAreEmpty(t *testing.T) {
 
 func TestParse_envOnly(t *testing.T) {
 	cfg := Parse(map[string]string{
-		"gobackup_container.env.DB":        "postgres",
+		"gobackup_container.env.DB":       "postgres",
 		"gobackup_container.labels.caddy": "x",
 	})
 	if len(cfg.Env) != 1 || cfg.Env[0] != "DB=postgres" {

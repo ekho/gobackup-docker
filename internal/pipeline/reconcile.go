@@ -47,10 +47,10 @@ type Lister interface {
 // is provided via WithContainerManager, it also discovers archive volumes from
 // source containers and ensures the gobackup container has the right mounts.
 type Reconciler struct {
-	cfg           Config
-	lister        Lister
-	writer        *apply.FileWriter
-	containerMgr  ContainerManager // optional, for archive volume support
+	cfg          Config
+	lister       Lister
+	writer       *apply.FileWriter
+	containerMgr ContainerManager // optional, for archive volume support
 
 	mu     sync.Mutex
 	status Status
