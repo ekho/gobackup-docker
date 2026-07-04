@@ -188,6 +188,54 @@ services:
 > **Excludes** are passed through as-is — they are glob patterns that apply inside the archive root, not paths that
 > need mount resolution.
 
+#### Controlling the recreated gobackup container (`gobackup_container.*`)
+
+Recreating the gobackup container needs a spec (image, command, networks, …). By default the supervisor reuses the
+settings of the container it replaces. To override them, put `gobackup_container.*` labels **on the supervisor's own
+container** — they are read once at startup via the supervisor's self-inspection:
+
+| Label (on the supervisor) | Example | Effect |
+|---|---|---|
+| `gobackup_container.image` | `huacnlee/gobackup:latest` | image of the recreated container |
+| `gobackup_container.command` | `/usr/local/bin/gobackup run -c /etc/gobackup/gobackup.yml` | command — **must be the full argv** (the stock image has no `ENTRYPOINT`) |
+| `gobackup_container.networks` | `backup_net,caddy_net` | networks to attach (real network names) |
+| `gobackup_container.env.<VAR>` | `${DB_PASSWORD}` | one env var per label; when any is set it **replaces** the env set |
+| `gobackup_container.labels.<key>` | `com.example.tier=infra` | extra labels passed through |
+
+Rules:
+
+- Each field **falls back** to the container being replaced when its label is absent — set only what you want to change.
+- Base mounts (the config volume, `/backups`, state) are **preserved automatically**; only the discovered archive
+  volumes are managed. Never list them here.
+- The gobackup container **must already exist** and carry the label `gobackup-docker.component: "gobackup"` — that is
+  how the supervisor finds the container to recreate. The supervisor recreates it; it does not create one from scratch.
+- The supervisor needs the Docker socket mounted (`:ro` is sufficient — Docker API calls are socket messages, not
+  file writes). gobackup itself never needs the socket.
+
+```yaml
+services:
+  gobackup-docker:                         # the supervisor
+    image: ghcr.io/ekho/gobackup-docker:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./defaults.yml:/etc/gobackup-docker/defaults.yml:ro
+      - gobackup-config:/etc/gobackup
+    labels:
+      gobackup_container.image: "huacnlee/gobackup:latest"
+      gobackup_container.command: "/usr/local/bin/gobackup run -c /etc/gobackup/gobackup.yml"
+      gobackup_container.networks: "backup_net"
+
+  gobackup:                                # recreated by the supervisor when archive volumes change
+    image: huacnlee/gobackup:latest
+    command: ["/usr/local/bin/gobackup", "run", "-c", "/etc/gobackup/gobackup.yml"]
+    labels:
+      gobackup-docker.component: "gobackup"   # ← how the supervisor finds it
+    volumes:
+      - gobackup-config:/etc/gobackup
+      - backups:/backups
+    networks: [backup_net]
+```
+
 #### Comma-separated arrays in labels
 
 Some gobackup fields are YAML **arrays**, but a Docker label is a flat string. The supervisor converts

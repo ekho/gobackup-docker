@@ -263,9 +263,19 @@ labels:
 **Два способа достучаться до БД:** (1) сеть+DSN (по умолчанию, `docker.sock` не нужен для чистых dump'ов БД, `host` = имя
 сервиса в общей сети); (2) `docker exec` в контейнер БД (модель offen; нужен socket) — опция на потом.
 
-**Файловые бэкапы:** `archive` работает по путям **внутри контейнера gobackup**, не по Docker-volume напрямую.
-Целевой volume надо смонтировать в контейнер gobackup (ro); Docker не умеет hot-add mount → либо предмонтирование,
-либо рестарт. DB-dump по сети этого ограничения не имеет.
+**Файловые бэкапы (auto-mount, реализовано):** `archive` работает по путям **внутри контейнера gobackup**. Docker не
+умеет hot-add mount, поэтому супервизор **пересоздаёт** контейнер gobackup: находит его по лейблу
+`gobackup-docker.component=gobackup`, инспектит source-контейнеры с `gobackup.archive.includes`, находит их volume'ы,
+переписывает includes в `/volumes/<model>/...` и пересоздаёт gobackup с этими volume'ами (ro) + сохранёнными базовыми
+mount'ами (config/`/backups`/state — всё, что не под `/volumes/`, через `mergeMounts`). Spec пересоздания берётся из
+`gobackup_container.*` лейблов на самом супервизоре (см. §5.8). Проверено e2e (`spike/e2e-mount/`), пересоздание
+one-shot без thrash. DB-dump по сети этого не требует.
+
+### 5.8 Spec пересоздаваемого контейнера (`gobackup_container.*`)
+Лейблы на **супервизоре** (читаются один раз при старте через self-inspect по `os.Hostname` → `ContainerInspect` →
+`container.Parse`): `image`, `command` (**полный argv** — у образа нет entrypoint), `networks` (CSV), `env.<VAR>`,
+`labels.<key>`. По каждому полю: лейбл выигрывает, иначе fallback к настройкам заменяемого контейнера. Component-label
+форсится (иначе следующий reconcile не найдёт контейнер). `docker.sock:ro` достаточно для create/stop/remove/start.
 
 ---
 

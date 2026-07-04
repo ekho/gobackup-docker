@@ -96,9 +96,10 @@ gcs/azure/webdav/ftp/scp/sftp), notifiers (mail/webhook/slack/discord/telegram/h
 `encrypt_with`/`split_with`/`schedule` работают без спец-кода на тип. Путь к БД по умолчанию — **сеть+DSN**.
 - ✅ **Smart scalar coercion** — реализовано с guard'ами (`internal/render/coerce.go`): `keep/port` → int, `enabled` → bool,
   но `chat_id`/`*_id`/`token`/`password`/`secret`/`key`/`host` и числа с ведущими нулями **остаются строками**. Покрыто тестами.
-- **Файловые бэкапы (`archive`)** ⚠️ — работают по путям **внутри контейнера gobackup**. Строгая cross-container валидация
-  из супервизора **невозможна** (он не владеет контейнером gobackup и его mount'ами) → вместо этого low-noise **guidance-лог**
-  при изменении конфига перечисляет модели с `archive` и напоминает про монтирование источника (см. §5.7). Авто-remount — вне v1.
+- ✅ **Файловые бэкапы (`archive`) — auto-mount реализован.** Супервизор находит volume'ы source-контейнеров,
+  переписывает includes в `/volumes/<model>/...` и **пересоздаёт** контейнер gobackup с ними (ro) + сохранёнными
+  базовыми mount'ами (`mergeMounts`). Spec пересоздания — из `gobackup_container.*` лейблов супервизора (ARCHITECTURE
+  §5.7–5.8). Проверено e2e (`spike/e2e-mount/`, один recreate, без thrash).
 
 **Критерий:** сквозной прогон Postgres → tgz в local storage проходит реальный `Perform()` — ✅ проверено (`spike/e2e/`).
 

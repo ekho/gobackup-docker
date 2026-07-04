@@ -1,7 +1,29 @@
 # Auto Volume Mount — Design Spec
 
 **Date:** 2026-07-04
-**Status:** Draft
+**Status:** Implemented (with the as-built deviations below) · verified e2e in `spike/e2e-mount/`
+
+## 0. As-built deviations from this draft
+
+The feature shipped, but a few decisions changed during implementation — the sections below are the original draft;
+where they differ, the as-built behaviour is:
+
+- **Managed-container label** (§5.1): the label is **`gobackup-docker.component: "gobackup"`**, not
+  `gobackup-docker.managed: "true"`.
+- **Base mounts** (§3.2, §4.1, §6.2): preserved from the **gobackup container's own** mounts, not copied from the
+  supervisor's. `mergeMounts` keeps every existing mount **not** under `/volumes/` (config, `/backups`, state) and adds
+  the archive mounts. Copying the supervisor's mounts would miss `/backups` (the supervisor doesn't mount it). This
+  also makes the mount set stable, so recreation is one-shot, not an endless loop.
+- **No hardcoded defaults** (§3.3): there is no `ContainerDefaults`. Per field, `gobackup_container.*` wins; otherwise
+  the value falls back to the **container being replaced**.
+- **`gobackup_container.command` must be the full argv** (§3.2/§3.3): e.g.
+  `/usr/local/bin/gobackup run -c /etc/gobackup/gobackup.yml` — the stock image has no `ENTRYPOINT`.
+- **The gobackup container must pre-exist** (§2.1, §5.2): the supervisor **recreates** the container found by the
+  component label; it does not create one from scratch when none exists (it logs and skips). Create it via compose.
+- **Docker socket `:ro` is sufficient** (§9): container stop/remove/create/start work over a read-only socket mount —
+  API calls are socket messages, not file writes. `rw` is not required. (Verified in the e2e.)
+- Wiring: `internal/container.Parse` → `main.readSelfContainerConfig` (self-inspect via `os.Hostname`) →
+  `Reconciler.WithGobackupSpec` → `pipeline.buildGobackupSpec`.
 
 ## 1. Problem
 
