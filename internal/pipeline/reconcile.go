@@ -7,8 +7,11 @@ import (
 	"context"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/docker/docker/api/types/mount"
 
 	"github.com/ekho/gobackup-docker/internal/apply"
 	"github.com/ekho/gobackup-docker/internal/container"
@@ -114,7 +117,7 @@ func (r *Reconciler) Run(ctx context.Context, trigger <-chan struct{}) {
 // reconcile does one full pass: list → parse+gate → render → apply. Any error
 // returns without applying, so the previously written config stays in place.
 func (r *Reconciler) reconcile(ctx context.Context) error {
-	models, nSources, changed, modelToContainer, err := r.render(ctx)
+	models, nSources, changed, modelToContainer, creds, err := r.render(ctx)
 	if err != nil {
 		r.mu.Lock()
 		r.status.LastError = err.Error()
@@ -159,25 +162,113 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 		log.Printf("[reconcile] wrote %s: %d model(s) from %d container(s)", r.writer.Path, len(names), nSources)
 	}
 
-	// Phase 3: ensure the gobackup container has the right volume mounts.
-	if r.containerMgr != nil && len(archiveMounts) > 0 {
-		if _, recreated, err := ensureGobackupContainerMounts(ctx, r.containerMgr, r.gobackupSpec, archiveMounts); err != nil {
-			log.Printf("[reconcile] gobackup container mount sync: %v", err)
+	// Phase 3: resolve credential sources (from the client containers) into engine
+	// additions — env vars (_env) and secret bind-mounts + command exports (_file).
+	extras := engineExtras{ExtraMounts: archiveMounts}
+	if r.containerMgr != nil && len(creds) > 0 {
+		ec := resolveCreds(ctx, r.containerMgr, creds)
+		extras.ExtraMounts = append(extras.ExtraMounts, ec.secretMounts...)
+		extras.EnvVars = ec.envVars
+		extras.SecretExports = ec.secretExports
+	}
+
+	// Phase 4: ensure the gobackup container matches the desired spec (mounts,
+	// credential env, secret command-wrapper). Only touch it when there is
+	// something to manage — archive volumes or credentials.
+	if r.containerMgr != nil && (len(extras.ExtraMounts) > 0 || len(extras.EnvVars) > 0 || len(extras.SecretExports) > 0) {
+		if _, recreated, err := ensureGobackupContainer(ctx, r.containerMgr, r.gobackupSpec, extras); err != nil {
+			log.Printf("[reconcile] gobackup container sync: %v", err)
 		} else if recreated {
-			log.Printf("[reconcile] gobackup container recreated with archive volume mounts")
+			log.Printf("[reconcile] gobackup container recreated (mounts/credentials)")
 		}
 	}
 
 	return nil
 }
 
+// resolvedEngineCreds are credential sources resolved against the client
+// containers, ready to feed the engine recreate.
+type resolvedEngineCreds struct {
+	envVars       []string
+	secretMounts  []docker.MountDef
+	secretExports []secretExport
+}
+
+// resolveCreds reads each credential's value source from its client container:
+// _env → the value of an env var (materialized into the engine's env); _file →
+// the host source of the secret's bind mount (re-mounted into the engine under
+// /gobackup-secrets/<VAR> and cat'd at start via the command wrapper). Sources
+// that can't be resolved (missing env var, or a secret with no host bind source —
+// swarm/environment secrets) are skipped with a log; the credential renders as an
+// empty ${VAR}, which gobackup treats as a connection failure (fail-closed).
+func resolveCreds(ctx context.Context, mgr ContainerManager, creds []render.ResolvedCred) resolvedEngineCreds {
+	var out resolvedEngineCreds
+	inspects := map[string]docker.InspectResult{}
+	seenTarget := map[string]bool{}
+
+	for _, c := range creds {
+		info, ok := inspects[c.ContainerID]
+		if !ok {
+			var err error
+			info, err = mgr.ContainerInspect(ctx, c.ContainerID)
+			if err != nil {
+				log.Printf("[creds] inspect source %s for %s: %v; skipping", shortID(c.ContainerID), c.Var, err)
+				continue
+			}
+			inspects[c.ContainerID] = info
+		}
+
+		switch c.Kind {
+		case labels.CredEnv:
+			val, found := lookupEnv(info.Env, c.Ref)
+			if !found {
+				log.Printf("[creds] env var %q not set in source %s; skipping %s", c.Ref, shortID(c.ContainerID), c.Var)
+				continue
+			}
+			out.envVars = append(out.envVars, c.Var+"="+val)
+
+		case labels.CredFile:
+			mp, _, err := findMountForPath(c.Ref, buildDestMap(info.Mounts))
+			if err != nil {
+				log.Printf("[creds] secret %q is not a bind-mounted file in source %s (swarm/environment secrets unsupported); skipping %s", c.Ref, shortID(c.ContainerID), c.Var)
+				continue
+			}
+			src := mountSource(mp)
+			if src == "" {
+				log.Printf("[creds] secret %q in source %s has no host source (tmpfs); skipping %s", c.Ref, shortID(c.ContainerID), c.Var)
+				continue
+			}
+			target := secretMountPrefix + c.Var
+			if seenTarget[target] {
+				continue
+			}
+			seenTarget[target] = true
+			out.secretMounts = append(out.secretMounts, docker.MountDef{
+				Type: mount.TypeBind, Source: src, Target: target, ReadOnly: true,
+			})
+			out.secretExports = append(out.secretExports, secretExport{Var: c.Var, Path: target})
+		}
+	}
+	return out
+}
+
+func lookupEnv(env []string, name string) (string, bool) {
+	prefix := name + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return e[len(prefix):], true
+		}
+	}
+	return "", false
+}
+
 // render performs list→parse→build→apply, returning the models map, the
 // number of contributing containers, whether the file changed, and a mapping
 // from model name → source container ID for archive volume discovery.
-func (r *Reconciler) render(ctx context.Context) (models map[string]any, nSources int, changed bool, modelToContainer map[string]string, err error) {
+func (r *Reconciler) render(ctx context.Context) (models map[string]any, nSources int, changed bool, modelToContainer map[string]string, creds []render.ResolvedCred, err error) {
 	containers, err := r.lister.List(ctx)
 	if err != nil {
-		return nil, 0, false, nil, err
+		return nil, 0, false, nil, nil, err
 	}
 
 	sources := make([]render.Source, 0, len(containers))
@@ -199,6 +290,7 @@ func (r *Reconciler) render(ctx context.Context) (models map[string]any, nSource
 			Name:        p.Name,
 			Profile:     p.Profile,
 			Model:       p.Model,
+			CredRefs:    p.CredRefs,
 		})
 	}
 
@@ -206,21 +298,21 @@ func (r *Reconciler) render(ctx context.Context) (models map[string]any, nSource
 	// error here aborts the reconcile and keeps the last-good file.
 	profiles, err := render.LoadProfiles(r.cfg.DefaultsPath)
 	if err != nil {
-		return nil, 0, false, nil, err
+		return nil, 0, false, nil, nil, err
 	}
 
-	cfg := render.Build(sources, profiles, r.cfg.HostID, r.cfg.Instance)
+	cfg, creds := render.BuildWithCreds(sources, profiles, r.cfg.HostID, r.cfg.Instance)
 	out, err := yaml.Marshal(cfg)
 	if err != nil {
-		return nil, 0, false, nil, err
+		return nil, 0, false, nil, nil, err
 	}
 
 	changed, err = r.writer.Apply(out)
 	if err != nil {
-		return nil, 0, false, nil, err
+		return nil, 0, false, nil, nil, err
 	}
 	models, _ = cfg["models"].(map[string]any)
-	return models, len(sources), changed, modelToContainer, nil
+	return models, len(sources), changed, modelToContainer, creds, nil
 }
 
 // processArchiveVolumes discovers volume mounts for models with archive.includes

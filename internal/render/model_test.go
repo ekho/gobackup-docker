@@ -8,6 +8,72 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+func TestBuildWithCreds(t *testing.T) {
+	src := Source{
+		Container: "nc", ContainerID: "cid1",
+		Model: map[string]any{
+			"databases": map[string]any{"db": map[string]any{"type": "postgresql"}},
+			"storages":  map[string]any{"local": map[string]any{"type": "local", "path": "/b"}},
+		},
+		CredRefs: []labels.CredRef{
+			{Path: []string{"databases", "db", "password"}, Kind: labels.CredEnv, Ref: "DB_PW"},
+			{Path: []string{"storages", "local", "secret_key"}, Kind: labels.CredFile, Ref: "/run/secrets/sk"},
+		},
+	}
+	cfg, creds := BuildWithCreds([]Source{src}, Profiles{}, "h", "")
+
+	m := cfg["models"].(map[string]any)["nc-h"].(map[string]any)
+	if got := m["databases"].(map[string]any)["db"].(map[string]any)["password"]; got != "${GB_NC_H_DATABASES_DB_PASSWORD}" {
+		t.Errorf("password placeholder = %v", got)
+	}
+	if got := m["storages"].(map[string]any)["local"].(map[string]any)["secret_key"]; got != "${GB_NC_H_STORAGES_LOCAL_SECRET_KEY}" {
+		t.Errorf("secret_key placeholder = %v", got)
+	}
+	if len(creds) != 2 {
+		t.Fatalf("want 2 resolved creds, got %d: %#v", len(creds), creds)
+	}
+	byVar := map[string]ResolvedCred{}
+	for _, c := range creds {
+		byVar[c.Var] = c
+	}
+	if c := byVar["GB_NC_H_DATABASES_DB_PASSWORD"]; c.Kind != labels.CredEnv || c.Ref != "DB_PW" || c.ContainerID != "cid1" {
+		t.Errorf("env cred = %#v", c)
+	}
+	if c := byVar["GB_NC_H_STORAGES_LOCAL_SECRET_KEY"]; c.Kind != labels.CredFile || c.Ref != "/run/secrets/sk" {
+		t.Errorf("file cred = %#v", c)
+	}
+}
+
+func TestBuildWithCreds_conflictAndEmptySkip(t *testing.T) {
+	// inline password AND password_env for the same key → skip the model, no creds.
+	conflict := Source{
+		Container: "x",
+		Model: map[string]any{
+			"databases": map[string]any{"db": map[string]any{"type": "pg", "password": "inline"}},
+			"storages":  map[string]any{"l": map[string]any{"type": "local"}},
+		},
+		CredRefs: []labels.CredRef{{Path: []string{"databases", "db", "password"}, Kind: labels.CredEnv, Ref: "X"}},
+	}
+	cfg, creds := BuildWithCreds([]Source{conflict}, Profiles{}, "h", "")
+	if len(cfg["models"].(map[string]any)) != 0 {
+		t.Error("model with inline+_env conflict must be skipped")
+	}
+	if len(creds) != 0 {
+		t.Errorf("no creds from a skipped model, got %#v", creds)
+	}
+
+	// empty reference → skip.
+	empty := Source{
+		Container: "y",
+		Model:     map[string]any{"databases": map[string]any{"db": map[string]any{"type": "pg"}}, "storages": map[string]any{"l": map[string]any{"type": "local"}}},
+		CredRefs:  []labels.CredRef{{Path: []string{"databases", "db", "password"}, Kind: labels.CredFile, Ref: ""}},
+	}
+	cfg2, _ := BuildWithCreds([]Source{empty}, Profiles{}, "h", "")
+	if len(cfg2["models"].(map[string]any)) != 0 {
+		t.Error("model with empty credential ref must be skipped")
+	}
+}
+
 func TestBuild_arrayFieldRendersAsYAMLSequence(t *testing.T) {
 	// End-to-end: a CSV label value at an array path must marshal to a real YAML
 	// block sequence in the generated config, not a quoted scalar gobackup would

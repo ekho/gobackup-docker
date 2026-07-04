@@ -31,6 +31,37 @@ const (
 	OptOut = "!none"
 )
 
+// CredKind is the source of a credential referenced by a label.
+type CredKind string
+
+const (
+	CredEnv  CredKind = "env"  // value comes from an env var in the client container
+	CredFile CredKind = "file" // value comes from a file (e.g. a Docker secret) in the client container
+)
+
+// credKeys is the allowlist of credential base-keys eligible for the
+// _env/_file suffix. It is intentionally NOT the whole isProtectedKey set:
+// keys like `host`/`*_id` aren't secrets, and — critically — `credentials` is
+// excluded so gobackup's real `storages.<id>.credentials_file` key (a GCS
+// keyfile path gobackup reads itself) is never hijacked as a credential ref.
+var credKeys = map[string]bool{
+	"password":   true,
+	"token":      true,
+	"secret":     true,
+	"access_key": true,
+	"secret_key": true,
+}
+
+// CredRef is a credential whose value is sourced indirectly (from an env var or
+// a file) rather than written inline. Path is the location of the credential key
+// in the model tree (e.g. ["databases","nc","password"]); render substitutes a
+// ${VAR} placeholder there and the pipeline resolves Ref into that VAR.
+type CredRef struct {
+	Path []string
+	Kind CredKind
+	Ref  string // env var name (Kind=env) or file path (Kind=file)
+}
+
 // Parsed is the decoded gobackup.* surface of one container: exactly one model.
 type Parsed struct {
 	Enabled  bool
@@ -38,6 +69,7 @@ type Parsed struct {
 	Instance string         // scope selector ("" = unscoped)
 	Profile  string         // defaults.yml profile name ("" => "default")
 	Model    map[string]any // the container's single model config tree
+	CredRefs []CredRef      // credentials sourced from env/file (_env/_file suffix labels)
 }
 
 // Parse decodes gobackup.* labels. exposedByDefault decides inclusion when the
@@ -59,10 +91,42 @@ func Parse(labels map[string]string, exposedByDefault bool) Parsed {
 		case profileKey:
 			p.Profile = v
 		default:
-			setPath(p.Model, strings.Split(rest, "."), v)
+			parts := strings.Split(rest, ".")
+			if ref, ok := credRef(parts, v); ok {
+				p.CredRefs = append(p.CredRefs, ref)
+				continue // credential ref: not a literal model value
+			}
+			setPath(p.Model, parts, v)
 		}
 	}
 	return p
+}
+
+// credRef recognises a credential-source label whose last segment is
+// <credkey>_env or <credkey>_file with <credkey> in the allowlist, e.g.
+// databases.nc.password_env. Returns the CredRef pointing at the credential key
+// (…password) with its kind and reference value.
+func credRef(parts []string, value string) (CredRef, bool) {
+	if len(parts) < 2 {
+		return CredRef{}, false
+	}
+	last := parts[len(parts)-1]
+	base, kind, ok := credentialSuffix(last)
+	if !ok {
+		return CredRef{}, false
+	}
+	path := append(append([]string(nil), parts[:len(parts)-1]...), base)
+	return CredRef{Path: path, Kind: kind, Ref: value}, true
+}
+
+func credentialSuffix(seg string) (base string, kind CredKind, ok bool) {
+	if b, found := strings.CutSuffix(seg, "_env"); found && credKeys[b] {
+		return b, CredEnv, true
+	}
+	if b, found := strings.CutSuffix(seg, "_file"); found && credKeys[b] {
+		return b, CredFile, true
+	}
+	return "", "", false
 }
 
 // setPath assigns val at a nested path, creating intermediate maps. If an

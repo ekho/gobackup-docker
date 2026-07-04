@@ -1,0 +1,63 @@
+# e2e for credential-from-Docker-secret (_file). Postgres's password comes from a
+# compose file: secret; the same secret is declared as the backup credential via
+# gobackup.databases.main.password_file. The supervisor re-mounts the secret's
+# host source into the recreated gobackup engine and reads it via the command
+# wrapper — the value never appears in the config or in docker inspect.
+name: gbde2ecreds
+
+volumes:
+  cfg:
+  backups:
+
+networks:
+  net:
+    name: gbde2ecreds_net
+
+secrets:
+  pgpw:
+    file: ./pgpw.txt
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/pgpw   # postgres reads its password from the secret
+      POSTGRES_DB: appdb
+    secrets: [pgpw]
+    networks: [net]
+    labels:
+      gobackup.enable: "true"
+      gobackup.name: "pgcreds"
+      gobackup.databases.main.type: "postgresql"
+      gobackup.databases.main.host: "postgres"
+      gobackup.databases.main.port: "5432"
+      gobackup.databases.main.database: "appdb"
+      gobackup.databases.main.username: "postgres"
+      gobackup.databases.main.password_file: "/run/secrets/pgpw"   # ← credential from the secret file
+
+  gobackup:
+    image: huacnlee/gobackup:latest
+    command: ["/usr/local/bin/gobackup", "run", "-c", "/etc/gobackup/gobackup.yml"]
+    restart: unless-stopped
+    labels:
+      gobackup-docker.component: "gobackup"
+    volumes:
+      - cfg:/etc/gobackup
+      - backups:/backups
+    networks: [net]
+
+  gobackup-docker:
+    image: gobackup-docker:dev
+    labels:
+      gobackup_container.image: "huacnlee/gobackup:latest"
+      gobackup_container.command: "/usr/local/bin/gobackup run -c /etc/gobackup/gobackup.yml"
+      gobackup_container.networks: "gbde2ecreds_net"
+    environment:
+      GOBACKUP_DOCKER_OUTPUT: /etc/gobackup/gobackup.yml
+      GOBACKUP_DOCKER_DEFAULTS: /etc/gobackup-docker/defaults.yml
+      GOBACKUP_DOCKER_DEBOUNCE: 300ms
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./defaults.yml:/etc/gobackup-docker/defaults.yml:ro
+      - cfg:/etc/gobackup
+    networks: [net]

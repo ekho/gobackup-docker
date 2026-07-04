@@ -2,6 +2,7 @@ package labels
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -119,6 +120,47 @@ func TestParse_modelTree(t *testing.T) {
 		if _, ok := got.Model[k]; ok {
 			t.Errorf("reserved key %q leaked into model tree", k)
 		}
+	}
+}
+
+func TestParse_credRefs(t *testing.T) {
+	labels := map[string]string{
+		"gobackup.enable":                        "true",
+		"gobackup.databases.nc.type":             "postgresql",
+		"gobackup.databases.nc.password_env":     "DB_PASSWORD", // → env credref
+		"gobackup.storages.s3.type":              "s3",
+		"gobackup.storages.s3.secret_key_file":   "/run/secrets/s3sk", // → file credref (base secret_key)
+		"gobackup.storages.gcs.credentials_file": "/keys/gcs.json",    // NOT a credref (real gobackup key)
+	}
+	got := Parse(labels, false)
+
+	// Two credrefs extracted.
+	byKey := map[string]CredRef{}
+	for _, c := range got.CredRefs {
+		byKey[strings.Join(c.Path, ".")] = c
+	}
+	if len(got.CredRefs) != 2 {
+		t.Fatalf("want 2 credrefs, got %d: %#v", len(got.CredRefs), got.CredRefs)
+	}
+	if c := byKey["databases.nc.password"]; c.Kind != CredEnv || c.Ref != "DB_PASSWORD" {
+		t.Errorf("password credref = %#v", c)
+	}
+	if c := byKey["storages.s3.secret_key"]; c.Kind != CredFile || c.Ref != "/run/secrets/s3sk" {
+		t.Errorf("secret_key credref = %#v", c)
+	}
+
+	// Credential leaves must NOT appear in the model tree.
+	nc := got.Model["databases"].(map[string]any)["nc"].(map[string]any)
+	if _, ok := nc["password_env"]; ok {
+		t.Error("password_env leaked into model tree")
+	}
+	if _, ok := nc["password"]; ok {
+		t.Error("credref must not pre-set the model value (render substitutes a placeholder)")
+	}
+	// gcs.credentials_file is a REAL gobackup key — must stay in the model, untouched.
+	gcs := got.Model["storages"].(map[string]any)["gcs"].(map[string]any)
+	if gcs["credentials_file"] != "/keys/gcs.json" {
+		t.Errorf("credentials_file must NOT be hijacked as a credref: %#v", gcs)
 	}
 }
 

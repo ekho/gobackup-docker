@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -28,6 +29,20 @@ type ContainerManager interface {
 const gobackupComponentLabel = "gobackup-docker.component"
 const gobackupComponentValue = "gobackup"
 
+// baseCmdLabel records the UNWRAPPED engine command as JSON on the recreated
+// container, so a subsequent reconcile recovers the base rather than re-wrapping
+// an already-wrapped command.
+const baseCmdLabel = "gobackup-docker.base-command"
+
+// engineExtras are the supervisor-computed additions to the recreated gobackup
+// container: managed mounts (archive volumes + secret files), credential env
+// vars (from _env credentials), and secret command-exports (from _file creds).
+type engineExtras struct {
+	ExtraMounts   []docker.MountDef
+	EnvVars       []string
+	SecretExports []secretExport
+}
+
 func findGobackupContainer(ctx context.Context, mgr ContainerManager) (*docker.InspectResult, error) {
 	containers, err := mgr.ListAll(ctx)
 	if err != nil {
@@ -45,11 +60,11 @@ func findGobackupContainer(ctx context.Context, mgr ContainerManager) (*docker.I
 	return nil, nil
 }
 
-func ensureGobackupContainerMounts(
+func ensureGobackupContainer(
 	ctx context.Context,
 	mgr ContainerManager,
 	cfg gbcontainer.Config,
-	desiredMounts []docker.MountDef,
+	extras engineExtras,
 ) (string, bool, error) {
 	existing, err := findGobackupContainer(ctx, mgr)
 	if err != nil {
@@ -61,16 +76,17 @@ func ensureGobackupContainerMounts(
 	}
 
 	// The desired mount set preserves the container's own mounts (config, backups,
-	// state — anything not under /volumes/) and adds the discovered archive mounts.
-	// Without this the recreated container would lose /etc/gobackup and /backups,
-	// and mountsEqual would never stabilize (endless recreate).
-	desired := mergeMounts(existing.Mounts, desiredMounts)
+	// state — anything not managed) and adds the archive + secret mounts. Without
+	// this the recreated container would lose /etc/gobackup and /backups, and the
+	// recreate check would never stabilize (endless recreate).
+	desiredMounts := mergeMounts(existing.Mounts, extras.ExtraMounts)
+	spec := buildGobackupSpec(cfg, *existing, desiredMounts, extras.EnvVars, extras.SecretExports)
 
-	if mountsEqual(existing.Mounts, desired) {
+	if !needsRecreate(*existing, spec, extras.EnvVars) {
 		return existing.ID, false, nil
 	}
 
-	log.Printf("[manage] gobackup container %q mounts changed — recreating", existing.Name)
+	log.Printf("[manage] gobackup container %q spec changed — recreating", existing.Name)
 
 	log.Printf("[manage] stopping container %s ...", shortID(existing.ID))
 	if err := mgr.ContainerStop(ctx, existing.ID, nil); err != nil {
@@ -81,10 +97,6 @@ func ensureGobackupContainerMounts(
 	if err := mgr.ContainerRemove(ctx, existing.ID, false); err != nil {
 		return "", false, fmt.Errorf("remove gobackup %s: %w", shortID(existing.ID), err)
 	}
-
-	// Build the new container's spec from the supervisor's gobackup_container.*
-	// labels (cfg), falling back to the removed container's settings per field.
-	spec := buildGobackupSpec(cfg, *existing, desired)
 
 	newID, err := mgr.ContainerCreate(ctx, spec)
 	if err != nil {
@@ -100,12 +112,49 @@ func ensureGobackupContainerMounts(
 	return newID, true, nil
 }
 
+// secretExport binds an env var to a secret file path inside the engine
+// container, materialized at container start by the command wrapper.
+type secretExport struct {
+	Var  string
+	Path string
+}
+
+// wrapCommandWithSecrets wraps the engine's base command so that each secret
+// file is read into an env var at start, then `exec`s the base command.
+// mechanism (B): the secret value never touches the config volume or docker
+// inspect (only the PATH appears in Cmd); `exec` makes gobackup PID 1 so
+// `docker stop` signals it. With no exports the base command is returned as-is.
+func wrapCommandWithSecrets(base []string, exports []secretExport) []string {
+	if len(exports) == 0 {
+		return base
+	}
+	var sb strings.Builder
+	for _, e := range exports {
+		// value flows through cat's stdout into a double-quoted $()—never
+		// re-tokenized; the path is single-quote-escaped so a hostile label
+		// path cannot break out.
+		fmt.Fprintf(&sb, `export %s="$(cat %s)"; `, e.Var, shQuote(e.Path))
+	}
+	sb.WriteString("exec")
+	for _, a := range base {
+		sb.WriteString(" ")
+		sb.WriteString(shQuote(a))
+	}
+	return []string{"/bin/sh", "-c", sb.String()}
+}
+
+// shQuote wraps s in POSIX single quotes, escaping embedded single quotes as
+// '\” — making any string safe to embed in a /bin/sh -c command.
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // buildGobackupSpec assembles the recreated gobackup container's spec. The
 // supervisor's gobackup_container.* labels (cfg) take precedence per field; any
 // field the supervisor did not set falls back to the removed container's own
 // settings. The component label is always forced on so the container stays
 // discoverable on the next reconcile, and the name is preserved.
-func buildGobackupSpec(cfg gbcontainer.Config, existing docker.InspectResult, mounts []docker.MountDef) docker.ContainerSpec {
+func buildGobackupSpec(cfg gbcontainer.Config, existing docker.InspectResult, mounts []docker.MountDef, envVars []string, secretExports []secretExport) docker.ContainerSpec {
 	spec := docker.ContainerSpec{
 		Name:   existing.Name,
 		Mounts: mounts,
@@ -116,15 +165,17 @@ func buildGobackupSpec(cfg gbcontainer.Config, existing docker.InspectResult, mo
 		spec.Image = cfg.Image
 	}
 
-	spec.Command = existing.Command
-	if cfg.Command != "" {
-		spec.Command = strings.Fields(cfg.Command)
-	}
+	// Command: recover the UNWRAPPED base first (never re-wrap an already-wrapped
+	// existing.Command), then wrap it to source any _file secrets at start.
+	base := baseCommand(cfg, existing)
+	spec.Command = wrapCommandWithSecrets(base, secretExports)
 
-	spec.Env = existing.Env
+	// Env: base (gobackup_container.env or existing) + credential vars (win).
+	baseEnv := existing.Env
 	if len(cfg.Env) > 0 {
-		spec.Env = cfg.Env
+		baseEnv = cfg.Env
 	}
+	spec.Env = mergeEnv(baseEnv, envVars)
 
 	spec.Networks = networkKeys(existing.Networks)
 	if len(cfg.Networks) > 0 {
@@ -132,9 +183,10 @@ func buildGobackupSpec(cfg gbcontainer.Config, existing docker.InspectResult, mo
 	}
 
 	// Labels: keep the existing container's labels (compose metadata etc.),
-	// overlay any gobackup_container.labels.* passthrough, then force the
-	// component label so findGobackupContainer can locate it next time.
-	labels := make(map[string]string, len(existing.Labels)+len(cfg.Labels)+1)
+	// overlay gobackup_container.labels.* passthrough, force the component label
+	// (so findGobackupContainer locates it next time), and record the UNWRAPPED
+	// base command so the next reconcile recovers it instead of re-wrapping.
+	labels := make(map[string]string, len(existing.Labels)+len(cfg.Labels)+2)
 	for k, v := range existing.Labels {
 		labels[k] = v
 	}
@@ -142,9 +194,65 @@ func buildGobackupSpec(cfg gbcontainer.Config, existing docker.InspectResult, mo
 		labels[k] = v
 	}
 	labels[gobackupComponentLabel] = gobackupComponentValue
+	labels[baseCmdLabel] = encodeBaseCmd(base)
 	spec.Labels = labels
 
 	return spec
+}
+
+// baseCommand resolves the UNWRAPPED engine command: an explicit
+// gobackup_container.command wins; otherwise the base recorded on the existing
+// container (so a wrapped command is never re-wrapped); otherwise existing as-is.
+func baseCommand(cfg gbcontainer.Config, existing docker.InspectResult) []string {
+	if cfg.Command != "" {
+		return strings.Fields(cfg.Command)
+	}
+	if b, ok := decodeBaseCmd(existing.Labels[baseCmdLabel]); ok {
+		return b
+	}
+	return existing.Command
+}
+
+func encodeBaseCmd(cmd []string) string {
+	b, _ := json.Marshal(cmd)
+	return string(b)
+}
+
+func decodeBaseCmd(s string) ([]string, bool) {
+	if s == "" {
+		return nil, false
+	}
+	var cmd []string
+	if err := json.Unmarshal([]byte(s), &cmd); err != nil || len(cmd) == 0 {
+		return nil, false
+	}
+	return cmd, true
+}
+
+// mergeEnv appends credential vars to the base env, with credential vars winning
+// over a base entry of the same key.
+func mergeEnv(base, creds []string) []string {
+	if len(creds) == 0 {
+		return base
+	}
+	credKey := make(map[string]bool, len(creds))
+	for _, c := range creds {
+		credKey[envKey(c)] = true
+	}
+	out := make([]string, 0, len(base)+len(creds))
+	for _, e := range base {
+		if !credKey[envKey(e)] {
+			out = append(out, e)
+		}
+	}
+	return append(out, creds...)
+}
+
+func envKey(e string) string {
+	if i := strings.IndexByte(e, '='); i >= 0 {
+		return e[:i]
+	}
+	return e
 }
 
 func mountsEqual(current []container.MountPoint, desired []docker.MountDef) bool {
@@ -171,23 +279,71 @@ func mountKey(mType mount.Type, source, target string, readOnly bool) string {
 	return fmt.Sprintf("%s|%s|%s|%t", string(mType), source, target, readOnly)
 }
 
-// archiveMountPrefix is where discovered source volumes are mounted inside the
-// gobackup container; mounts under it are considered supervisor-managed.
-const archiveMountPrefix = "/volumes/"
+// needsRecreate decides whether the engine must be recreated to reach the desired
+// spec. It checks the managed dimensions only — mounts, the (possibly wrapped)
+// command, and the presence of each credential env var — deliberately ignoring
+// image-injected env like PATH so the check stabilizes instead of looping.
+func needsRecreate(existing docker.InspectResult, spec docker.ContainerSpec, credVars []string) bool {
+	if !mountsEqual(existing.Mounts, spec.Mounts) {
+		return true
+	}
+	if !slicesEqual(existing.Command, spec.Command) {
+		return true
+	}
+	for _, cv := range credVars {
+		if !containsString(existing.Env, cv) {
+			return true // credential var missing or its value changed (rotation)
+		}
+	}
+	return false
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func containsString(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// Supervisor-managed mount prefixes: archive volumes and secret files live under
+// these. Everything else on the engine (config, /backups, state) is preserved
+// across recreates.
+const (
+	archiveMountPrefix = "/volumes/"
+	secretMountPrefix  = "/gobackup-secrets/"
+)
+
+func isManagedMount(dest string) bool {
+	return strings.HasPrefix(dest, archiveMountPrefix) || strings.HasPrefix(dest, secretMountPrefix)
+}
 
 // mergeMounts returns the full desired mount set for the gobackup container:
-// every existing mount that is NOT a managed archive mount (config, backups,
-// state, ...) converted to a MountDef, plus the freshly-discovered archive
-// mounts. Stale archive mounts (under /volumes/) are dropped and replaced.
-func mergeMounts(existing []container.MountPoint, archive []docker.MountDef) []docker.MountDef {
-	out := make([]docker.MountDef, 0, len(existing)+len(archive))
+// every existing mount that is NOT supervisor-managed (config, backups, state,
+// ...) converted to a MountDef, plus the freshly-computed managed mounts. Stale
+// managed mounts (archive volumes, secret files) are dropped and replaced.
+func mergeMounts(existing []container.MountPoint, managed []docker.MountDef) []docker.MountDef {
+	out := make([]docker.MountDef, 0, len(existing)+len(managed))
 	for _, mp := range existing {
-		if strings.HasPrefix(mp.Destination, archiveMountPrefix) {
+		if isManagedMount(mp.Destination) {
 			continue
 		}
 		out = append(out, mountPointToDef(mp))
 	}
-	out = append(out, archive...)
+	out = append(out, managed...)
 	return out
 }
 

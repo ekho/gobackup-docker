@@ -13,8 +13,40 @@ import (
 	"github.com/ekho/gobackup-docker/internal/apply"
 	gbcontainer "github.com/ekho/gobackup-docker/internal/container"
 	"github.com/ekho/gobackup-docker/internal/docker"
+	"github.com/ekho/gobackup-docker/internal/labels"
+	"github.com/ekho/gobackup-docker/internal/render"
 	"gopkg.in/yaml.v3"
 )
+
+func TestResolveCreds(t *testing.T) {
+	cm := &fakeContainerManager{
+		results: map[string]docker.InspectResult{
+			"c1": {
+				Env:    []string{"DB_PW=secret", "OTHER=x"},
+				Mounts: []container.MountPoint{mpBind("/host/sk", "/run/secrets/sk")},
+			},
+		},
+	}
+	creds := []render.ResolvedCred{
+		{Var: "GB_A", Kind: labels.CredEnv, Ref: "DB_PW", ContainerID: "c1"},
+		{Var: "GB_B", Kind: labels.CredFile, Ref: "/run/secrets/sk", ContainerID: "c1"},
+		{Var: "GB_C", Kind: labels.CredEnv, Ref: "MISSING", ContainerID: "c1"}, // skipped
+	}
+	out := resolveCreds(context.Background(), cm, creds)
+
+	if len(out.envVars) != 1 || out.envVars[0] != "GB_A=secret" {
+		t.Errorf("envVars = %#v, want [GB_A=secret]", out.envVars)
+	}
+	if len(out.secretMounts) != 1 {
+		t.Fatalf("secretMounts = %#v", out.secretMounts)
+	}
+	if m := out.secretMounts[0]; m.Source != "/host/sk" || m.Target != "/gobackup-secrets/GB_B" || !m.ReadOnly {
+		t.Errorf("secret mount = %#v, want /host/sk → /gobackup-secrets/GB_B ro", m)
+	}
+	if len(out.secretExports) != 1 || out.secretExports[0] != (secretExport{Var: "GB_B", Path: "/gobackup-secrets/GB_B"}) {
+		t.Errorf("secretExports = %#v", out.secretExports)
+	}
+}
 
 type fakeLister struct {
 	containers []docker.Container

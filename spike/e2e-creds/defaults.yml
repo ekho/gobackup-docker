@@ -1,0 +1,13 @@
+# creds e2e: schedule every minute so the DAEMON (which holds the wrapper env)
+# performs the backup — see the docker-exec caveat.
+default:
+  schedule:
+    cron: "* * * * *"
+  compress_with:
+    type: tgz
+  default_storage: local
+  storages:
+    local:
+      type: local
+      path: /backups/{{ .Model }}
+      keep: 3

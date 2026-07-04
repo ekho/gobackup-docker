@@ -301,6 +301,47 @@ Two practical rules for `${VAR}`:
 Never write `${MODEL}` for the model name: gobackup would treat it as an environment variable and blank it. That is
 why the supervisor uses `{{ ... }}`, and only for its own substitutions.
 
+### Credentials from an env var or a Docker secret
+
+Instead of writing a credential inline (or wiring `${VAR}` yourself), a client container can **declare where the value
+lives** and let the supervisor bridge it into the engine. Add an `_env` or `_file` suffix to a credential key:
+
+```yaml
+labels:
+  gobackup.databases.main.password_env:  "DB_PASSWORD"          # value = $DB_PASSWORD in THIS container's env
+  # or
+  gobackup.databases.main.password_file: "/run/secrets/db_pw"   # value = a Docker secret file in THIS container
+```
+
+Supported credential keys: **`password`, `token`, `secret`, `access_key`, `secret_key`** (and the same under
+`storages.<id>.*` / `notifiers.<id>.*`). `credentials_file` (gobackup's own GCS keyfile key) is **not** affected.
+Set at most one of the inline key, `_env`, or `_file` — a conflict or an unresolved value **skips the model** (fail-closed).
+
+Both render the config with a placeholder only — the plaintext is **never** written to `gobackup.yml`:
+
+```yaml
+databases:
+  main:
+    password: ${GB_<MODEL>_DATABASES_MAIN_PASSWORD}
+```
+
+How each is resolved (the engine container is recreated to apply it):
+
+| Source | How the value reaches gobackup | Plaintext exposure | Rotation |
+|---|---|---|---|
+| `_env` | supervisor reads the var from the **client** container's env and sets it in the **engine's** env | visible in `docker inspect` of the engine (it was already an env var) | needs a recreate to change |
+| `_file` | supervisor re-mounts the secret's host file into the engine (RO) and a command wrapper `cat`s it into the env at start | **none** — not in `gobackup.yml`, not in `docker inspect` (only the path shows); the supervisor never reads it | re-read on each config reload |
+
+Notes & limits:
+
+- `_file` works with **Compose `file:` secrets** (they have a host bind source). **Swarm** `docker secret` and Compose
+  `environment:` secrets have no re-mountable host source → skipped with a log (use `_env`, or a bind-mounted file).
+- The `_file` value is injected into the **daemon's** process env, so scheduled/API-triggered backups see it. A
+  `gobackup perform` run via `docker exec` starts a fresh process and will **not** — trigger `_file`-credential backups
+  through the schedule or the control-plane `POST /api/perform`, not `docker exec`.
+- Requires the supervisor to manage the engine (Docker socket + `gobackup-docker.component=gobackup` on it), same as
+  archive auto-mount.
+
 ### Overrides & opt-outs
 
 A container inherits the profile and changes only what differs:
