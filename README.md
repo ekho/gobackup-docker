@@ -157,11 +157,42 @@ else is a config path that goes straight into the model body.
 
 Because Docker Compose coerces unquoted `true`/`no`/`on` into booleans, **quote every label value**.
 
-### Array-typed fields (comma-separated strings)
+### Archive file backups with automatic volume mounting
 
-Some gobackup config fields are YAML **arrays**, but a Docker label can only hold a flat string. For these fields you
-write a **comma-separated string** and the supervisor converts it to a proper array in the rendered `gobackup.yml`.
-Spaces around commas are trimmed; a single value becomes a one-element array; an empty value becomes an empty array.
+`gobackup.archive.includes` backs up file **paths** — but those paths must exist inside the **gobackup container**, not
+the application container. The supervisor can **automatically discover** which volumes the application container uses
+and ensure they are mounted into the gobackup container.
+
+**What happens**: when a model has `archive.includes`, the supervisor:
+
+1. Inspects the source container's mounts via the Docker API.
+2. Finds the MountPoint that matches each archive path.
+3. Transforms the path → `/volumes/<model>/<original-path>` (so paths from different models never collide).
+4. Stops, removes, and recreates the gobackup container with the discovered volumes mounted read-only (`:ro`).
+
+**No manual volume pre‑mounting is needed** for named Docker volumes or bind mounts — the supervisor handles it.
+
+```yaml
+services:
+  nextcloud:
+    labels:
+      gobackup.enable: "true"
+      gobackup.archive.includes: "/var/www/html,/etc/nginx"
+      gobackup.archive.excludes: "*.log,*.tmp"
+  # The supervisor will:
+  #   1. find nextcloud's volumes (e.g. nextcloud_html → /var/www/html)
+  #   2. add them as read-only mounts on the gobackup container
+  #   3. rewrite includes to /volumes/nextcloud/var/www/html
+```
+
+> **Excludes** are passed through as-is — they are glob patterns that apply inside the archive root, not paths that
+> need mount resolution.
+
+#### Comma-separated arrays in labels
+
+Some gobackup fields are YAML **arrays**, but a Docker label is a flat string. The supervisor converts
+**comma-separated** values to proper arrays. Spaces around commas are trimmed; a single value becomes a one-element
+array; an empty value becomes an empty array.
 
 ```yaml
 labels:
@@ -389,24 +420,11 @@ internal network.
 - **Databases (default):** the supervisor and the database share a Docker network, and the label `host` is the
   database's service name. gobackup connects over the network and runs the native dump tool (`pg_dump`, `mysqldump`,
   …), all of which are bundled in the stock `gobackup` image. Pure database dumps need no access beyond the network.
-- **File / volume backups (`gobackup.archive.includes`):** gobackup archives paths **inside its own container**, not
-  the labeled container's. So the source volume must be **mounted into the gobackup container** (read-only) at the path
-  you reference. Docker can't hot-add a mount to a running container, so pre-mount the volumes you intend to archive.
-
-  ```yaml
-  services:
-    gobackup:
-      volumes:
-        - nextcloud_html:/var/www/html:ro   # named volume or bind mount
-        - nextcloud_config:/etc/nginx:ro
-
-    nextcloud:
-      labels:
-        gobackup.archive.includes: "/var/www/html,/etc/nginx"
-        gobackup.archive.excludes: "*.log,*.tmp"
-  ```
-
-  See [Array-typed fields](#array-typed-fields-archiveincludes--archiveexcludes) for the label syntax.
+- **File / volume backups (`gobackup.archive.includes`):** the supervisor **automatically discovers** the source
+  container's Docker volumes and bind mounts, and ensures they are mounted into the gobackup container. Paths are
+  rewritten to `/volumes/<model>/` to prevent collisions. No manual volume pre‑mounting is required — just add the
+  labels. See [Archive file backups with automatic volume mounting](#archive-file-backups-with-automatic-volume-mounting)
+  for details.
 
 ---
 
