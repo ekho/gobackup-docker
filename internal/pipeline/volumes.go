@@ -54,23 +54,15 @@ func discoverArchiveVolumes(
 	seen := map[string]bool{}
 
 	transform := func(path string) (string, error) {
-		mnt, mountDest, err := findMountForPath(path, destMap)
+		md, tp, err := resolvePathMount(destMap, modelName, path, true) // archive mounts are read-only
 		if err != nil {
 			return "", err
 		}
-
-		key := mnt.Source + ":" + mountDest
-		if !seen[key] {
-			seen[key] = true
-			mounts = append(mounts, docker.MountDef{
-				Type:     convertMountType(mnt.Type),
-				Source:   mountSource(mnt),
-				Target:   "/volumes/" + modelName + mountDest,
-				ReadOnly: true,
-			})
+		if !seen[md.Target] {
+			seen[md.Target] = true
+			mounts = append(mounts, md)
 		}
-
-		return "/volumes/" + modelName + path, nil
+		return tp, nil
 	}
 
 	transformedIncludes := make([]string, 0, len(includes))
@@ -94,6 +86,74 @@ func discoverArchiveVolumes(
 		Includes:  transformedIncludes,
 		Excludes:  transformedExcludes,
 	}, nil
+}
+
+// resolvePathMount finds the mount backing `path` in a container and returns a
+// MountDef that re-mounts that volume into the gobackup engine under
+// /volumes/<modelName><mountDest>, plus `path` rewritten to that location.
+func resolvePathMount(destMap map[string]container.MountPoint, modelName, path string, readOnly bool) (docker.MountDef, string, error) {
+	mnt, mountDest, err := findMountForPath(path, destMap)
+	if err != nil {
+		return docker.MountDef{}, "", err
+	}
+	md := docker.MountDef{
+		Type:     convertMountType(mnt.Type),
+		Source:   mountSource(mnt),
+		Target:   "/volumes/" + modelName + mountDest,
+		ReadOnly: readOnly,
+	}
+	return md, "/volumes/" + modelName + path, nil
+}
+
+// sqliteMountsForModel rewrites each sqlite database's `path` to where its
+// backing volume is mounted in the engine, and returns those mounts. The mounts
+// are READ-WRITE: gobackup dumps sqlite via `sqlite3 <path> .dump`, which opens
+// the DB and (for WAL-mode databases) needs to write -wal/-shm sidecar files.
+// A path not backed by a mount, absent, or already transformed is skipped.
+func sqliteMountsForModel(destMap map[string]container.MountPoint, modelName string, dbs map[string]any) []docker.MountDef {
+	var mounts []docker.MountDef
+	seen := map[string]bool{}
+	for id, dbv := range dbs {
+		db, ok := dbv.(map[string]any)
+		if !ok || db["type"] != "sqlite" {
+			continue
+		}
+		path, _ := db["path"].(string)
+		if path == "" || strings.HasPrefix(path, "/volumes/") {
+			continue
+		}
+		md, tp, err := resolvePathMount(destMap, modelName, path, false) // RW — see doc
+		if err != nil {
+			log.Printf("[volumes] model %q sqlite %q: path %q not on a mounted volume; skipping (backup will fail unless the file is already in the engine)", modelName, id, path)
+			continue
+		}
+		db["path"] = tp
+		if !seen[md.Target] {
+			seen[md.Target] = true
+			mounts = append(mounts, md)
+		}
+	}
+	return mounts
+}
+
+// dedupMountsByTarget collapses mounts sharing a target (a container can't have
+// two mounts at one path). When both a read-only and a read-write mount want the
+// same target, the writable one wins — it is a superset (sqlite needs RW; an
+// archive read is fine on a RW mount).
+func dedupMountsByTarget(mounts []docker.MountDef) []docker.MountDef {
+	idx := map[string]int{}
+	var out []docker.MountDef
+	for _, m := range mounts {
+		if i, ok := idx[m.Target]; ok {
+			if out[i].ReadOnly && !m.ReadOnly {
+				out[i] = m // read-write wins
+			}
+			continue
+		}
+		idx[m.Target] = len(out)
+		out = append(out, m)
+	}
+	return out
 }
 
 func buildDestMap(mounts []container.MountPoint) map[string]container.MountPoint {

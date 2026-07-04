@@ -35,6 +35,70 @@ func mpBind(source, dest string) container.MountPoint {
 	}
 }
 
+func TestSqliteMountsForModel(t *testing.T) {
+	destMap := buildDestMap([]container.MountPoint{mpVolume("botdata", "/app/data")})
+	dbs := map[string]any{
+		"shop": map[string]any{"type": "sqlite", "path": "/app/data/bot_database.sqlite3"},
+		"pg":   map[string]any{"type": "postgresql", "host": "db"},
+	}
+	mounts := sqliteMountsForModel(destMap, "shop-h", dbs)
+
+	if got := dbs["shop"].(map[string]any)["path"]; got != "/volumes/shop-h/app/data/bot_database.sqlite3" {
+		t.Errorf("sqlite path = %v, want transformed", got)
+	}
+	if dbs["pg"].(map[string]any)["host"] != "db" {
+		t.Errorf("non-sqlite db must not be touched: %#v", dbs["pg"])
+	}
+	if len(mounts) != 1 {
+		t.Fatalf("want 1 mount, got %#v", mounts)
+	}
+	if m := mounts[0]; m.Source != "botdata" || m.Target != "/volumes/shop-h/app/data" || m.ReadOnly {
+		t.Errorf("sqlite mount = %#v, want botdata → /volumes/shop-h/app/data, READ-WRITE", m)
+	}
+}
+
+func TestSqliteMountsForModel_skips(t *testing.T) {
+	destMap := buildDestMap([]container.MountPoint{mpVolume("botdata", "/app/data")})
+
+	unmatched := map[string]any{"x": map[string]any{"type": "sqlite", "path": "/elsewhere/db.sqlite3"}}
+	if m := sqliteMountsForModel(destMap, "m", unmatched); len(m) != 0 {
+		t.Errorf("path not on a mount → no mount, got %#v", m)
+	}
+	if unmatched["x"].(map[string]any)["path"] != "/elsewhere/db.sqlite3" {
+		t.Error("unmatched path must be left unchanged")
+	}
+
+	other := map[string]any{
+		"a": map[string]any{"type": "sqlite"},                                          // no path
+		"b": map[string]any{"type": "sqlite", "path": "/volumes/m/app/data/x.sqlite3"}, // already transformed
+		"c": map[string]any{"type": "mysql", "path": "/app/data/x"},                    // not sqlite
+	}
+	if m := sqliteMountsForModel(destMap, "m", other); len(m) != 0 {
+		t.Errorf("no-path / already-transformed / non-sqlite must be skipped, got %#v", m)
+	}
+}
+
+func TestDedupMountsByTarget(t *testing.T) {
+	out := dedupMountsByTarget([]docker.MountDef{
+		{Source: "v", Target: "/volumes/m/app/data", ReadOnly: true},  // archive RO
+		{Source: "v", Target: "/volumes/m/app/data", ReadOnly: false}, // sqlite RW, same target
+		{Source: "w", Target: "/volumes/m/other", ReadOnly: true},
+	})
+	if len(out) != 2 {
+		t.Fatalf("want 2 mounts after dedup, got %d: %#v", len(out), out)
+	}
+	byT := map[string]docker.MountDef{}
+	for _, m := range out {
+		byT[m.Target] = m
+	}
+	if byT["/volumes/m/app/data"].ReadOnly {
+		t.Error("RW must win over RO for a shared target")
+	}
+	if !byT["/volumes/m/other"].ReadOnly {
+		t.Error("distinct target must be preserved as-is")
+	}
+}
+
 func TestMergeMounts_preservesBaseDropsStaleArchiveAddsNew(t *testing.T) {
 	existing := []container.MountPoint{
 		mpVolume("cfg", "/etc/gobackup"),

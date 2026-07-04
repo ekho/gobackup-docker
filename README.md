@@ -50,7 +50,8 @@ A burst of events (e.g. `docker compose up`) is **debounced** into a single rege
 regenerate the config; the actual backups run on gobackup's own schedule.
 
 Backups themselves — database dumps, compression, encryption, upload, retention — are done entirely by gobackup.
-This tool only generates its configuration.
+This tool generates its configuration and, when a backup needs data that only lives in another container, **recreates
+the gobackup container to mount that data in** (archive files read-only, SQLite database files read-write — see below).
 
 ---
 
@@ -211,8 +212,8 @@ container** — they are read once at startup via the supervisor's self-inspecti
 Rules:
 
 - Each field **falls back** to the container being replaced when its label is absent — set only what you want to change.
-- Base mounts (the config volume, `/backups`, state) are **preserved automatically**; only the discovered archive
-  volumes are managed. Never list them here.
+- Base mounts (the config volume, `/backups`, state) are **preserved automatically**; only the auto-discovered
+  backup-source volumes (archive includes and SQLite database files) are managed. Never list them here.
 - The gobackup container **must already exist** and carry the label `gobackup-docker.component: "gobackup"` — that is
   how the supervisor finds the container to recreate. The supervisor recreates it; it does not create one from scratch.
 - The supervisor needs the Docker socket mounted (`:ro` is sufficient — Docker API calls are socket messages, not
@@ -231,7 +232,7 @@ services:
       gobackup_container.command: "/usr/local/bin/gobackup run -c /etc/gobackup/gobackup.yml"
       gobackup_container.networks: "backup_net"
 
-  gobackup:                                # recreated by the supervisor when archive volumes change
+  gobackup:                                # recreated by the supervisor when auto-mounted volumes or credentials change
     image: huacnlee/gobackup:latest
     command: ["/usr/local/bin/gobackup", "run", "-c", "/etc/gobackup/gobackup.yml"]
     labels:
@@ -271,6 +272,39 @@ The full set of array fields (this is exhaustive for gobackup — every field it
 > may contain commas). Only the paths in the table above are converted.
 
 A value that must contain a literal comma can't be expressed this way — a rare case for table names and paths.
+
+### SQLite databases by file path (automatic volume mounting)
+
+gobackup dumps a SQLite database by reading its **file** (`sqlite3 <path> .dump`) — so, exactly like archive paths,
+that file must exist inside the **gobackup container**, not the application container. Declare the database by the
+path it has in your application and the supervisor mounts it into the engine for you:
+
+```yaml
+services:
+  bot:
+    volumes:
+      - botdata:/app/data                                  # the app's own data volume
+    labels:
+      gobackup.enable: "true"
+      gobackup.name: "shop"
+      gobackup.databases.main.type: "sqlite"
+      gobackup.databases.main.path: "/app/data/bot_database.sqlite3"
+```
+
+**What happens**: for each `type: sqlite` database with a `path`, the supervisor:
+
+1. Inspects the source container and finds the volume (or bind mount) backing that path.
+2. Rewrites `databases.<id>.path` → `/volumes/<model>/<original-path>` (so paths from different models never collide).
+3. Recreates the gobackup container with that volume mounted — **read-write**.
+
+The mount is **read-write**, unlike read-only archive mounts: `sqlite3 <path> .dump` opens the database, and a
+WAL-mode database writes `-wal`/`-shm` sidecar files next to it on open. The volume's **directory** is mounted (not
+just the file), so those sidecars have somewhere to go.
+
+> Uses the same recreation machinery as archive auto-mount — the `gobackup_container.*` spec and the
+> `gobackup-docker.component: "gobackup"` marker apply the same way (see above). A `path` already under `/volumes/`,
+> or one not backed by any volume, is left untouched (with a log). The stock `gobackup` image already bundles
+> `sqlite3`, so no extra setup is needed.
 
 ### Model naming
 
@@ -512,14 +546,18 @@ internal network.
 
 ## Reaching databases and backing up files
 
-- **Databases (default):** the supervisor and the database share a Docker network, and the label `host` is the
-  database's service name. gobackup connects over the network and runs the native dump tool (`pg_dump`, `mysqldump`,
-  …), all of which are bundled in the stock `gobackup` image. Pure database dumps need no access beyond the network.
+- **Databases over the network (postgresql, mysql, mongodb, …):** the supervisor and the database share a Docker
+  network, and the label `host` is the database's service name. gobackup connects over the network and runs the
+  native dump tool (`pg_dump`, `mysqldump`, …), all of which are bundled in the stock `gobackup` image. These dumps
+  need no access beyond the network. (File-based engines like SQLite are the exception — see the next bullet.)
 - **File / volume backups (`gobackup.archive.includes`):** the supervisor **automatically discovers** the source
   container's Docker volumes and bind mounts, and ensures they are mounted into the gobackup container. Paths are
   rewritten to `/volumes/<model>/` to prevent collisions. No manual volume pre‑mounting is required — just add the
   labels. See [Archive file backups with automatic volume mounting](#archive-file-backups-with-automatic-volume-mounting)
   for details.
+- **SQLite databases (`gobackup.databases.<id>.type: sqlite`):** file-based, not network. The supervisor mounts the
+  DB file's backing volume into the engine **read-write** and rewrites `path` to `/volumes/<model>/…`, just like
+  archive files. See [SQLite databases by file path](#sqlite-databases-by-file-path-automatic-volume-mounting).
 
 ---
 

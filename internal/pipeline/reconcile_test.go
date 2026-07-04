@@ -351,6 +351,57 @@ func TestReconcile_recreateUsesGobackupSpec(t *testing.T) {
 	}
 }
 
+func TestReconcile_sqliteVolumes(t *testing.T) {
+	defaults := writeDefaults(t, defaultsProfile)
+	out := filepath.Join(t.TempDir(), "gobackup.yml")
+
+	lister := &fakeLister{containers: []docker.Container{{
+		ID: "c1", Name: "bot",
+		Labels: map[string]string{
+			"gobackup.enable":              "true",
+			"gobackup.name":                "shop",
+			"gobackup.databases.main.type": "sqlite",
+			"gobackup.databases.main.path": "/app/data/bot_database.sqlite3",
+		},
+	}}}
+	cm := &fakeContainerManager{
+		all: []docker.Container{{ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}}},
+		results: map[string]docker.InspectResult{
+			"c1":  {Mounts: []container.MountPoint{mpVolume("botdata", "/app/data")}},
+			"gb1": {ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}},
+		},
+	}
+	r := NewReconciler(Config{DefaultsPath: defaults, HostID: "h"}, lister, &apply.FileWriter{Path: out}).WithContainerManager(cm)
+	if err := r.reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	// Written config: the sqlite path is rewritten to the mounted location.
+	b, _ := os.ReadFile(out)
+	var doc map[string]any
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	got := doc["models"].(map[string]any)["shop"].(map[string]any)["databases"].(map[string]any)["main"].(map[string]any)["path"]
+	if got != "/volumes/shop/app/data/bot_database.sqlite3" {
+		t.Errorf("sqlite path in config = %v, want transformed", got)
+	}
+
+	// Engine recreated with the sqlite volume mounted READ-WRITE.
+	if cm.createdSpec == nil {
+		t.Fatal("gobackup container was not recreated")
+	}
+	found := false
+	for _, m := range cm.createdSpec.Mounts {
+		if m.Target == "/volumes/shop/app/data" && m.Source == "botdata" && !m.ReadOnly {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("sqlite volume not mounted read-write into engine: %#v", cm.createdSpec.Mounts)
+	}
+}
+
 func TestWatchFile_firesOnWrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "defaults.yml")

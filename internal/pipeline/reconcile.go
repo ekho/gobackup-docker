@@ -125,26 +125,26 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 		return err
 	}
 
-	// Phase 2: archive volume discovery — if any model uses archive.includes,
-	// inspect the source containers and transform the paths so they mount at
-	// /volumes/<model>/... inside the gobackup container.
-	var archiveMounts []docker.MountDef
+	// Phase 2: volume discovery — inspect source containers and re-mount their
+	// volumes into the gobackup engine under /volumes/<model>/..., transforming
+	// both archive.includes (read-only) and sqlite databases' `path` (read-write).
+	var managedMounts []docker.MountDef
 	if r.containerMgr != nil {
-		archiveMounts, err = r.processArchiveVolumes(ctx, models, modelToContainer)
-		if err != nil {
-			log.Printf("[reconcile] archive volume discovery failed: %v (continuing with label-only config)", err)
-		} else if len(archiveMounts) > 0 {
-			// Re-marshal and write since models were updated.
+		archiveMounts, aerr := r.processArchiveVolumes(ctx, models, modelToContainer)
+		if aerr != nil {
+			log.Printf("[reconcile] archive volume discovery failed: %v (continuing with label-only config)", aerr)
+		}
+		sqliteMounts := r.processSqliteVolumes(ctx, models, modelToContainer)
+		managedMounts = dedupMountsByTarget(append(archiveMounts, sqliteMounts...))
+		if len(managedMounts) > 0 {
+			// Re-marshal and write since models' paths were transformed.
 			out, marshalErr := yaml.Marshal(map[string]any{"models": models})
 			if marshalErr != nil {
-				log.Printf("[reconcile] re-marshal after archive update: %v", marshalErr)
+				log.Printf("[reconcile] re-marshal after volume mapping: %v", marshalErr)
+			} else if changed2, applyErr := r.writer.Apply(out); applyErr != nil {
+				log.Printf("[reconcile] write after volume mapping: %v", applyErr)
 			} else {
-				changed2, applyErr := r.writer.Apply(out)
-				if applyErr != nil {
-					log.Printf("[reconcile] write after archive update: %v", applyErr)
-				} else {
-					changed = changed || changed2
-				}
+				changed = changed || changed2
 			}
 		}
 	}
@@ -164,7 +164,7 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 
 	// Phase 3: resolve credential sources (from the client containers) into engine
 	// additions — env vars (_env) and secret bind-mounts + command exports (_file).
-	extras := engineExtras{ExtraMounts: archiveMounts}
+	extras := engineExtras{ExtraMounts: managedMounts}
 	if r.containerMgr != nil && len(creds) > 0 {
 		ec := resolveCreds(ctx, r.containerMgr, creds)
 		extras.ExtraMounts = append(extras.ExtraMounts, ec.secretMounts...)
@@ -359,6 +359,49 @@ func (r *Reconciler) processArchiveVolumes(
 		return nil, nil
 	}
 	return applyArchiveVolumes(models, vols), nil
+}
+
+// processSqliteVolumes re-mounts the backing volume of each sqlite database's
+// `path` into the gobackup engine and rewrites the path to the mounted location
+// (analogous to archive, but read-write). Returns the mounts to add.
+func (r *Reconciler) processSqliteVolumes(ctx context.Context, models map[string]any, modelToContainer map[string]string) []docker.MountDef {
+	var mounts []docker.MountDef
+	for modelName, m := range models {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		dbs, _ := mm["databases"].(map[string]any)
+		if !hasSqlitePath(dbs) {
+			continue
+		}
+		containerID := modelToContainer[modelName]
+		if containerID == "" {
+			log.Printf("[reconcile] model %q: no source container for sqlite mount", modelName)
+			continue
+		}
+		info, err := r.containerMgr.ContainerInspect(ctx, containerID)
+		if err != nil {
+			log.Printf("[reconcile] model %q: inspect for sqlite mount: %v", modelName, err)
+			continue
+		}
+		mounts = append(mounts, sqliteMountsForModel(buildDestMap(info.Mounts), modelName, dbs)...)
+	}
+	return mounts
+}
+
+// hasSqlitePath reports whether any database is a sqlite DB with an untransformed path.
+func hasSqlitePath(dbs map[string]any) bool {
+	for _, dbv := range dbs {
+		db, ok := dbv.(map[string]any)
+		if !ok || db["type"] != "sqlite" {
+			continue
+		}
+		if p, _ := db["path"].(string); p != "" && !strings.HasPrefix(p, "/volumes/") {
+			return true
+		}
+	}
+	return false
 }
 
 func modelNames(models map[string]any) []string {

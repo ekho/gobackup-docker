@@ -1,0 +1,65 @@
+# e2e for sqlite path auto-mount: an app owns a sqlite DB file inside a named
+# volume and declares it as a gobackup sqlite database by file path. The
+# supervisor finds the volume backing that path, RE-MOUNTS it READ-WRITE into
+# the recreated gobackup engine at /volumes/shop/app/data, and rewrites
+# databases.main.path to that location so `sqlite3 <path> .dump` can read it.
+name: gbde2esqlite
+
+volumes:
+  cfg:
+  backups:
+  botdata:
+
+networks:
+  net:
+    name: gbde2esqlite_net
+
+services:
+  # Seeds a real sqlite DB into botdata, then idles. Uses the gobackup image
+  # only because it already ships sqlite3 (no apk/network needed at runtime).
+  app:
+    image: huacnlee/gobackup:latest
+    command:
+      - "sh"
+      - "-c"
+      - >-
+        sqlite3 /app/data/bot_database.sqlite3
+        "CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, note TEXT);
+         INSERT INTO orders(note) VALUES('sqlite-e2e-ok');" &&
+        echo seeded && sleep 3600
+    volumes:
+      - botdata:/app/data
+    networks: [net]
+    labels:
+      gobackup.enable: "true"
+      gobackup.name: "shop"
+      gobackup.databases.main.type: "sqlite"
+      gobackup.databases.main.path: "/app/data/bot_database.sqlite3"
+
+  gobackup:
+    image: huacnlee/gobackup:latest
+    command: ["/usr/local/bin/gobackup", "run", "-c", "/etc/gobackup/gobackup.yml"]
+    restart: unless-stopped   # survive the initial no-config window before recreate
+    labels:
+      gobackup-docker.component: "gobackup"   # how the supervisor finds it
+    volumes:
+      - cfg:/etc/gobackup
+      - backups:/backups
+    networks: [net]
+
+  gobackup-docker:
+    image: gobackup-docker:dev
+    labels:
+      # spec for the recreated gobackup container (read from the supervisor itself):
+      gobackup_container.image: "huacnlee/gobackup:latest"
+      gobackup_container.command: "/usr/local/bin/gobackup run -c /etc/gobackup/gobackup.yml"
+      gobackup_container.networks: "gbde2esqlite_net"
+    environment:
+      GOBACKUP_DOCKER_OUTPUT: /etc/gobackup/gobackup.yml
+      GOBACKUP_DOCKER_DEFAULTS: /etc/gobackup-docker/defaults.yml
+      GOBACKUP_DOCKER_DEBOUNCE: 300ms
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./defaults.yml:/etc/gobackup-docker/defaults.yml:ro
+      - cfg:/etc/gobackup
+    networks: [net]
