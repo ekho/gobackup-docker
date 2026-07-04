@@ -31,5 +31,18 @@ jobs:
       - name: Build and push (linux/amd64, linux/arm64)
         run: |
           image=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')  # GHCR requires lowercase
-          docker buildx build --platform linux/amd64,linux/arm64 \
-            -t "$image:$REF_TAG" -t "$image:latest" --push .
+          ver="${REF_TAG#v}"                                    # v2.2.45 -> 2.2.45
+
+          # A clean X.Y.Z release also moves the minor, major and latest tags
+          # (v2.2.45 -> 2.2.45, 2.2, 2, latest). A pre-release (e.g. v2.2.0-rc1)
+          # publishes only its exact version, so it never hijacks the moving tags.
+          if [[ "$ver" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            tags=("$ver" "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" "${BASH_REMATCH[1]}" "latest")
+          else
+            tags=("$ver")
+          fi
+
+          args=()
+          for t in "${tags[@]}"; do args+=(-t "$image:$t"); done
+          echo "Publishing tags: ${tags[*]}"
+          docker buildx build --platform linux/amd64,linux/arm64 "${args[@]}" --push .
