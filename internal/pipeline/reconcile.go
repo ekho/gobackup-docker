@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ekho/gobackup-docker/internal/apply"
+	"github.com/ekho/gobackup-docker/internal/container"
 	"github.com/ekho/gobackup-docker/internal/docker"
 	"github.com/ekho/gobackup-docker/internal/labels"
 	"github.com/ekho/gobackup-docker/internal/render"
@@ -51,6 +52,7 @@ type Reconciler struct {
 	lister       Lister
 	writer       *apply.FileWriter
 	containerMgr ContainerManager // optional, for archive volume support
+	gobackupSpec container.Config // gobackup_container.* from the supervisor's own labels
 
 	mu     sync.Mutex
 	status Status
@@ -68,6 +70,13 @@ func NewReconciler(cfg Config, lister Lister, w *apply.FileWriter) *Reconciler {
 // WithContainerManager attaches a ContainerManager for archive volume support.
 func (r *Reconciler) WithContainerManager(mgr ContainerManager) *Reconciler {
 	r.containerMgr = mgr
+	return r
+}
+
+// WithGobackupSpec supplies the gobackup_container.* config parsed from the
+// supervisor's own labels; it shapes the recreated gobackup container's spec.
+func (r *Reconciler) WithGobackupSpec(cfg container.Config) *Reconciler {
+	r.gobackupSpec = cfg
 	return r
 }
 
@@ -152,7 +161,7 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 
 	// Phase 3: ensure the gobackup container has the right volume mounts.
 	if r.containerMgr != nil && len(archiveMounts) > 0 {
-		if _, recreated, err := ensureGobackupContainerMounts(ctx, r.containerMgr, archiveMounts); err != nil {
+		if _, recreated, err := ensureGobackupContainerMounts(ctx, r.containerMgr, r.gobackupSpec, archiveMounts); err != nil {
 			log.Printf("[reconcile] gobackup container mount sync: %v", err)
 		} else if recreated {
 			log.Printf("[reconcile] gobackup container recreated with archive volume mounts")

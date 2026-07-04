@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ekho/gobackup-docker/internal/apply"
+	"github.com/ekho/gobackup-docker/internal/container"
 	"github.com/ekho/gobackup-docker/internal/docker"
 	"github.com/ekho/gobackup-docker/internal/pipeline"
 	"github.com/ekho/gobackup-docker/internal/webapi"
@@ -47,7 +48,9 @@ func main() {
 	}
 
 	writer := &apply.FileWriter{Path: outputPath}
-	rec := pipeline.NewReconciler(cfg, dc, writer).WithContainerManager(dc)
+	rec := pipeline.NewReconciler(cfg, dc, writer).
+		WithContainerManager(dc).
+		WithGobackupSpec(readSelfContainerConfig(ctx, dc))
 
 	trigger := make(chan struct{}, 1)
 	fire := func() {
@@ -76,6 +79,33 @@ func main() {
 
 	rec.Run(ctx, trigger)
 	log.Printf("[main] shutdown")
+}
+
+// readSelfContainerConfig inspects the supervisor's own container (found via its
+// hostname, which Docker sets to the container id by default) and parses its
+// gobackup_container.* labels into a container.Config used when recreating the
+// managed gobackup container. Failures degrade gracefully to an empty Config
+// (the recreate then falls back to the existing container's settings).
+func readSelfContainerConfig(ctx context.Context, dc *docker.Client) container.Config {
+	if v := os.Getenv("GOBACKUP_DOCKER_SELF_ID"); v != "" {
+		if self, err := dc.ContainerInspect(ctx, v); err == nil {
+			return container.Parse(self.Labels)
+		} else {
+			log.Printf("[main] self-inspect via GOBACKUP_DOCKER_SELF_ID=%s failed: %v", v, err)
+			return container.Config{}
+		}
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		log.Printf("[main] cannot read hostname for self-inspect; gobackup_container.* labels ignored: %v", err)
+		return container.Config{}
+	}
+	self, err := dc.ContainerInspect(ctx, host)
+	if err != nil {
+		log.Printf("[main] self-inspect (%s) failed; gobackup_container.* labels ignored: %v", host, err)
+		return container.Config{}
+	}
+	return container.Parse(self.Labels)
 }
 
 func env(key, def string) string {

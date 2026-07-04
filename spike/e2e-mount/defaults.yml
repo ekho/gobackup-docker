@@ -1,0 +1,10 @@
+# e2e-mount profile: local storage so we can inspect the produced archive.
+default:
+  compress_with:
+    type: tgz
+  default_storage: local
+  storages:
+    local:
+      type: local
+      path: /backups/{{ .Model }}
+      keep: 3

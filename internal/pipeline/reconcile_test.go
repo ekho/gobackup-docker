@@ -11,6 +11,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 
 	"github.com/ekho/gobackup-docker/internal/apply"
+	gbcontainer "github.com/ekho/gobackup-docker/internal/container"
 	"github.com/ekho/gobackup-docker/internal/docker"
 	"gopkg.in/yaml.v3"
 )
@@ -183,14 +184,16 @@ func TestRun_debounceCoalesces(t *testing.T) {
 
 // fakeContainerManager returns canned inspect results for archive volume tests.
 type fakeContainerManager struct {
-	results map[string]docker.InspectResult
-	all     []docker.Container
+	results     map[string]docker.InspectResult
+	all         []docker.Container
+	createdSpec *docker.ContainerSpec // last spec passed to ContainerCreate
 }
 
 func (f *fakeContainerManager) ContainerInspect(_ context.Context, id string) (docker.InspectResult, error) {
 	return f.results[id], nil
 }
-func (f *fakeContainerManager) ContainerCreate(_ context.Context, _ docker.ContainerSpec) (string, error) {
+func (f *fakeContainerManager) ContainerCreate(_ context.Context, spec docker.ContainerSpec) (string, error) {
+	f.createdSpec = &spec
 	return "new-id", nil
 }
 func (f *fakeContainerManager) ContainerStart(_ context.Context, _ string) error          { return nil }
@@ -256,6 +259,63 @@ func TestReconcile_archiveVolumes(t *testing.T) {
 	excludesRaw := arch["excludes"].([]any)
 	if len(excludesRaw) != 1 || excludesRaw[0].(string) != "*.log" {
 		t.Errorf("excludes = %#v", excludesRaw)
+	}
+}
+
+func TestReconcile_recreateUsesGobackupSpec(t *testing.T) {
+	// End-to-end wiring: WithGobackupSpec (from the supervisor's own labels) must
+	// shape the recreated gobackup container, not the existing container's image.
+	defaults := writeDefaults(t, defaultsProfile)
+	out := filepath.Join(t.TempDir(), "gobackup.yml")
+
+	lister := &fakeLister{containers: []docker.Container{{
+		ID:   "c1",
+		Name: "app",
+		Labels: map[string]string{
+			"gobackup.enable":           "true",
+			"gobackup.name":             "myapp",
+			"gobackup.archive.includes": "/var/www/html",
+		},
+	}}}
+
+	cm := &fakeContainerManager{
+		all: []docker.Container{
+			{ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}},
+		},
+		results: map[string]docker.InspectResult{
+			"c1": {Mounts: []container.MountPoint{mpVolume("html_data", "/var/www/html")}},
+			"gb1": {
+				ID:     "gb1",
+				Name:   "gobackup",
+				Image:  "orig/image:1",
+				Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue},
+				Mounts: nil, // differs from desired → triggers recreate
+			},
+		},
+	}
+
+	r := NewReconciler(Config{DefaultsPath: defaults, HostID: "h"}, lister, &apply.FileWriter{Path: out}).
+		WithContainerManager(cm).
+		WithGobackupSpec(gbcontainer.Config{
+			Image:   "custom/gobackup:9",
+			Command: "/usr/local/bin/gobackup run -c /x",
+		})
+
+	if err := r.reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if cm.createdSpec == nil {
+		t.Fatal("gobackup container was not recreated")
+	}
+	if cm.createdSpec.Image != "custom/gobackup:9" {
+		t.Errorf("recreated Image = %q, want custom/gobackup:9 (from gobackup_container.image, not existing)", cm.createdSpec.Image)
+	}
+	if got := cm.createdSpec.Command; len(got) != 4 || got[0] != "/usr/local/bin/gobackup" {
+		t.Errorf("recreated Command = %#v, want full argv from label", got)
+	}
+	if cm.createdSpec.Labels[gobackupComponentLabel] != gobackupComponentValue {
+		t.Errorf("recreated container lost the component label (unfindable next reconcile): %#v", cm.createdSpec.Labels)
 	}
 }
 

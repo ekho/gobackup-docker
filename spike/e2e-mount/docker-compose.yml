@@ -1,0 +1,54 @@
+# e2e for auto-mount: an app owns a data volume and requests a file archive.
+# The supervisor discovers the volume, rewrites the archive paths, and RECREATES
+# the gobackup container with that volume mounted at /volumes/app/... using the
+# gobackup_container.* spec from the supervisor's own labels.
+name: gbde2emount
+
+volumes:
+  cfg:
+  backups:
+  appdata:
+
+networks:
+  net:
+    name: gbde2emount_net
+
+services:
+  app:
+    image: alpine:3.20
+    command: ["sh", "-c", "echo hello-e2e > /data/marker.txt && sleep 3600"]
+    volumes:
+      - appdata:/data
+    networks: [net]
+    labels:
+      gobackup.enable: "true"
+      gobackup.name: "app"
+      gobackup.archive.includes: "/data"
+
+  gobackup:
+    image: huacnlee/gobackup:latest
+    command: ["/usr/local/bin/gobackup", "run", "-c", "/etc/gobackup/gobackup.yml"]
+    restart: unless-stopped   # survive the initial no-config window before recreate
+    labels:
+      gobackup-docker.component: "gobackup"   # how the supervisor finds it
+    volumes:
+      - cfg:/etc/gobackup
+      - backups:/backups
+    networks: [net]
+
+  gobackup-docker:
+    image: gobackup-docker:dev
+    labels:
+      # spec for the recreated gobackup container (read from the supervisor itself):
+      gobackup_container.image: "huacnlee/gobackup:latest"
+      gobackup_container.command: "/usr/local/bin/gobackup run -c /etc/gobackup/gobackup.yml"
+      gobackup_container.networks: "gbde2emount_net"
+    environment:
+      GOBACKUP_DOCKER_OUTPUT: /etc/gobackup/gobackup.yml
+      GOBACKUP_DOCKER_DEFAULTS: /etc/gobackup-docker/defaults.yml
+      GOBACKUP_DOCKER_DEBOUNCE: 300ms
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./defaults.yml:/etc/gobackup-docker/defaults.yml:ro
+      - cfg:/etc/gobackup
+    networks: [net]

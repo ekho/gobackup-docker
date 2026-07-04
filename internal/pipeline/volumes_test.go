@@ -35,6 +35,48 @@ func mpBind(source, dest string) container.MountPoint {
 	}
 }
 
+func TestMergeMounts_preservesBaseDropsStaleArchiveAddsNew(t *testing.T) {
+	existing := []container.MountPoint{
+		mpVolume("cfg", "/etc/gobackup"),
+		mpVolume("backups", "/backups"),
+		mpVolume("stale", "/volumes/old/data"), // previously-managed archive → must be dropped
+	}
+	archive := []docker.MountDef{
+		{Type: mount.TypeVolume, Source: "html_data", Target: "/volumes/myapp/var/www/html", ReadOnly: true},
+	}
+	got := mergeMounts(existing, archive)
+
+	byTarget := map[string]docker.MountDef{}
+	for _, m := range got {
+		byTarget[m.Target] = m
+	}
+	if _, ok := byTarget["/etc/gobackup"]; !ok {
+		t.Error("config volume must be preserved (else recreated gobackup can't read its config)")
+	}
+	if _, ok := byTarget["/backups"]; !ok {
+		t.Error("backups volume must be preserved")
+	}
+	if _, ok := byTarget["/volumes/old/data"]; ok {
+		t.Error("stale archive mount must be dropped")
+	}
+	if _, ok := byTarget["/volumes/myapp/var/www/html"]; !ok {
+		t.Error("new archive mount must be added")
+	}
+	if len(got) != 3 {
+		t.Errorf("want 3 mounts (cfg, backups, new archive), got %d: %#v", len(got), got)
+	}
+	if byTarget["/etc/gobackup"].Source != "cfg" {
+		t.Errorf("preserved volume should keep its name as source: %#v", byTarget["/etc/gobackup"])
+	}
+}
+
+func TestMergeMounts_emptyArchiveKeepsBase(t *testing.T) {
+	got := mergeMounts([]container.MountPoint{mpVolume("cfg", "/etc/gobackup")}, nil)
+	if len(got) != 1 || got[0].Target != "/etc/gobackup" {
+		t.Errorf("got %#v, want [cfg→/etc/gobackup]", got)
+	}
+}
+
 func TestDiscoverArchiveVolumes_emptyIncludes(t *testing.T) {
 	inspector := &fakeInspector{}
 	av, err := discoverArchiveVolumes(context.Background(), inspector, "c1", "m1", nil, nil)
