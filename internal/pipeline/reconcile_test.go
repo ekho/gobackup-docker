@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
+
 	"github.com/ekho/gobackup-docker/internal/apply"
 	"github.com/ekho/gobackup-docker/internal/docker"
 	"gopkg.in/yaml.v3"
@@ -176,6 +178,82 @@ func TestRun_debounceCoalesces(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if got := lister.calls.Load(); got != 2 {
 		t.Fatalf("expected 2 reconciles after second trigger, got %d", got)
+	}
+}
+
+// fakeContainerManager returns canned inspect results for archive volume tests.
+type fakeContainerManager struct {
+	results map[string]docker.InspectResult
+	all     []docker.Container
+}
+
+func (f *fakeContainerManager) ContainerInspect(_ context.Context, id string) (docker.InspectResult, error) {
+	return f.results[id], nil
+}
+func (f *fakeContainerManager) ContainerCreate(_ context.Context, _ docker.ContainerSpec) (string, error) {
+	return "new-id", nil
+}
+func (f *fakeContainerManager) ContainerStart(_ context.Context, _ string) error { return nil }
+func (f *fakeContainerManager) ContainerStop(_ context.Context, _ string, _ *int) error { return nil }
+func (f *fakeContainerManager) ContainerRemove(_ context.Context, _ string, _ bool) error { return nil }
+func (f *fakeContainerManager) ListAll(_ context.Context) ([]docker.Container, error) { return f.all, nil }
+
+func TestReconcile_archiveVolumes(t *testing.T) {
+	defaults := writeDefaults(t, defaultsProfile)
+	out := filepath.Join(t.TempDir(), "gobackup.yml")
+
+	lister := &fakeLister{containers: []docker.Container{
+		{
+			ID:   "c1",
+			Name: "app",
+			Labels: map[string]string{
+				"gobackup.enable":               "true",
+				"gobackup.name":                 "myapp",
+				"gobackup.archive.includes":     "/var/www/html,/etc/nginx",
+				"gobackup.archive.excludes":     "*.log",
+				"gobackup.databases.db.type":    "postgresql",
+				"gobackup.databases.db.host":    "app-db",
+			},
+		},
+	}}
+
+	cm := &fakeContainerManager{
+		results: map[string]docker.InspectResult{
+			"c1": {Mounts: []container.MountPoint{
+				mpVolume("html_data", "/var/www/html"),
+				mpVolume("nginx_cfg", "/etc/nginx"),
+			}},
+		},
+	}
+
+	r := NewReconciler(Config{DefaultsPath: defaults, HostID: "h"}, lister, &apply.FileWriter{Path: out})
+	r.WithContainerManager(cm)
+
+	models := readModels(t, r, out)
+	m, ok := models["myapp"].(map[string]any)
+	if !ok {
+		t.Fatalf("model 'myapp' not found: %#v", models)
+	}
+
+	arch, ok := m["archive"].(map[string]any)
+	if !ok {
+		t.Fatal("model missing archive block")
+	}
+
+	includesRaw := arch["includes"].([]any)
+	if len(includesRaw) != 2 {
+		t.Fatalf("expected 2 includes, got %d: %#v", len(includesRaw), includesRaw)
+	}
+	if includesRaw[0].(string) != "/volumes/myapp/var/www/html" {
+		t.Errorf("includes[0] = %q", includesRaw[0])
+	}
+	if includesRaw[1].(string) != "/volumes/myapp/etc/nginx" {
+		t.Errorf("includes[1] = %q", includesRaw[1])
+	}
+
+	excludesRaw := arch["excludes"].([]any)
+	if len(excludesRaw) != 1 || excludesRaw[0].(string) != "*.log" {
+		t.Errorf("excludes = %#v", excludesRaw)
 	}
 }
 

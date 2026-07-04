@@ -43,11 +43,14 @@ type Lister interface {
 	List(ctx context.Context) ([]docker.Container, error)
 }
 
-// Reconciler regenerates the gobackup config on demand.
+// Reconciler regenerates the gobackup config on demand. When a ContainerManager
+// is provided via WithContainerManager, it also discovers archive volumes from
+// source containers and ensures the gobackup container has the right mounts.
 type Reconciler struct {
-	cfg    Config
-	lister Lister
-	writer *apply.FileWriter
+	cfg           Config
+	lister        Lister
+	writer        *apply.FileWriter
+	containerMgr  ContainerManager // optional, for archive volume support
 
 	mu     sync.Mutex
 	status Status
@@ -60,6 +63,12 @@ func NewReconciler(cfg Config, lister Lister, w *apply.FileWriter) *Reconciler {
 		writer: w,
 		status: Status{Instance: cfg.Instance, HostID: cfg.HostID, ExposedByDefault: cfg.ExposedByDefault},
 	}
+}
+
+// WithContainerManager attaches a ContainerManager for archive volume support.
+func (r *Reconciler) WithContainerManager(mgr ContainerManager) *Reconciler {
+	r.containerMgr = mgr
+	return r
 }
 
 // Status returns a copy of the latest reconcile snapshot (safe for concurrent use).
@@ -96,12 +105,36 @@ func (r *Reconciler) Run(ctx context.Context, trigger <-chan struct{}) {
 // reconcile does one full pass: list → parse+gate → render → apply. Any error
 // returns without applying, so the previously written config stays in place.
 func (r *Reconciler) reconcile(ctx context.Context) error {
-	models, nSources, changed, err := r.render(ctx)
+	models, nSources, changed, modelToContainer, err := r.render(ctx)
 	if err != nil {
 		r.mu.Lock()
 		r.status.LastError = err.Error()
 		r.mu.Unlock()
 		return err
+	}
+
+	// Phase 2: archive volume discovery — if any model uses archive.includes,
+	// inspect the source containers and transform the paths so they mount at
+	// /volumes/<model>/... inside the gobackup container.
+	var archiveMounts []docker.MountDef
+	if r.containerMgr != nil {
+		archiveMounts, err = r.processArchiveVolumes(ctx, models, modelToContainer)
+		if err != nil {
+			log.Printf("[reconcile] archive volume discovery failed: %v (continuing with label-only config)", err)
+		} else if len(archiveMounts) > 0 {
+			// Re-marshal and write since models were updated.
+			out, marshalErr := yaml.Marshal(map[string]any{"models": models})
+			if marshalErr != nil {
+				log.Printf("[reconcile] re-marshal after archive update: %v", marshalErr)
+			} else {
+				changed2, applyErr := r.writer.Apply(out)
+				if applyErr != nil {
+					log.Printf("[reconcile] write after archive update: %v", applyErr)
+				} else {
+					changed = changed || changed2
+				}
+			}
+		}
 	}
 
 	names := modelNames(models)
@@ -115,22 +148,31 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 
 	if changed {
 		log.Printf("[reconcile] wrote %s: %d model(s) from %d container(s)", r.writer.Path, len(names), nSources)
-		if a := modelsWithArchive(models); len(a) > 0 {
-			log.Printf("[reconcile] note: models %v use file archive — ensure their include paths are mounted into the gobackup container", a)
+	}
+
+	// Phase 3: ensure the gobackup container has the right volume mounts.
+	if r.containerMgr != nil && len(archiveMounts) > 0 {
+		if _, recreated, err := ensureGobackupContainerMounts(ctx, r.containerMgr, archiveMounts); err != nil {
+			log.Printf("[reconcile] gobackup container mount sync: %v", err)
+		} else if recreated {
+			log.Printf("[reconcile] gobackup container recreated with archive volume mounts")
 		}
 	}
+
 	return nil
 }
 
-// render performs the pure list→parse→build→apply, returning the models map, the
-// number of contributing containers, and whether the file changed.
-func (r *Reconciler) render(ctx context.Context) (models map[string]any, nSources int, changed bool, err error) {
+// render performs list→parse→build→apply, returning the models map, the
+// number of contributing containers, whether the file changed, and a mapping
+// from model name → source container ID for archive volume discovery.
+func (r *Reconciler) render(ctx context.Context) (models map[string]any, nSources int, changed bool, modelToContainer map[string]string, err error) {
 	containers, err := r.lister.List(ctx)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, false, nil, err
 	}
 
 	sources := make([]render.Source, 0, len(containers))
+	modelToContainer = make(map[string]string, len(containers))
 	for _, c := range containers {
 		p := labels.Parse(c.Labels, r.cfg.ExposedByDefault)
 		if !p.Enabled || len(p.Model) == 0 {
@@ -140,11 +182,14 @@ func (r *Reconciler) render(ctx context.Context) (models map[string]any, nSource
 		if r.cfg.Instance != "" && p.Instance != "" && p.Instance != r.cfg.Instance {
 			continue
 		}
+		modelName := render.ModelName(c.Name, p.Name, r.cfg.HostID)
+		modelToContainer[modelName] = c.ID
 		sources = append(sources, render.Source{
-			Container: c.Name,
-			Name:      p.Name,
-			Profile:   p.Profile,
-			Model:     p.Model,
+			Container:   c.Name,
+			ContainerID: c.ID,
+			Name:        p.Name,
+			Profile:     p.Profile,
+			Model:       p.Model,
 		})
 	}
 
@@ -152,21 +197,67 @@ func (r *Reconciler) render(ctx context.Context) (models map[string]any, nSource
 	// error here aborts the reconcile and keeps the last-good file.
 	profiles, err := render.LoadProfiles(r.cfg.DefaultsPath)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, false, nil, err
 	}
 
 	cfg := render.Build(sources, profiles, r.cfg.HostID, r.cfg.Instance)
 	out, err := yaml.Marshal(cfg)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, false, nil, err
 	}
 
 	changed, err = r.writer.Apply(out)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, false, nil, err
 	}
 	models, _ = cfg["models"].(map[string]any)
-	return models, len(sources), changed, nil
+	return models, len(sources), changed, modelToContainer, nil
+}
+
+// processArchiveVolumes discovers volume mounts for models with archive.includes
+// and updates the models map with transformed paths. Returns the combined mount
+// list for the gobackup container.
+func (r *Reconciler) processArchiveVolumes(
+	ctx context.Context,
+	models map[string]any,
+	modelToContainer map[string]string,
+) ([]docker.MountDef, error) {
+	var vols []ArchiveVolumes
+	for modelName, m := range models {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		archive, _ := mm["archive"].(map[string]any)
+		if archive == nil {
+			continue
+		}
+		includes, _ := toStrSlice(archive["includes"])
+		excludes, _ := toStrSlice(archive["excludes"])
+		if len(includes) == 0 && len(excludes) == 0 {
+			continue
+		}
+
+		containerID := modelToContainer[modelName]
+		if containerID == "" {
+			log.Printf("[reconcile] model %q: no source container ID for archive discovery", modelName)
+			continue
+		}
+
+		av, err := discoverArchiveVolumes(ctx, r.containerMgr, containerID, modelName, includes, excludes)
+		if err != nil {
+			log.Printf("[reconcile] model %q: archive volume discovery: %v (skipping archive transform)", modelName, err)
+			continue
+		}
+		if len(av.Includes) > 0 || len(av.Excludes) > 0 {
+			vols = append(vols, av)
+		}
+	}
+
+	if len(vols) == 0 {
+		return nil, nil
+	}
+	return applyArchiveVolumes(models, vols), nil
 }
 
 func modelNames(models map[string]any) []string {
@@ -189,4 +280,23 @@ func modelsWithArchive(models map[string]any) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// toStrSlice converts a yaml-decoded value to a string slice.
+// YAML unmarshal produces []any for arrays; this handles both.
+func toStrSlice(v any) ([]string, bool) {
+	switch val := v.(type) {
+	case []string:
+		return val, true
+	case []any:
+		out := make([]string, 0, len(val))
+		for _, item := range val {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out, len(out) > 0 || len(val) == 0
+	default:
+		return nil, false
+	}
 }
