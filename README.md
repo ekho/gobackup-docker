@@ -4,6 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/ekho/gobackup-docker?sort=semver)](https://github.com/ekho/gobackup-docker/releases)
 [![Container image](https://img.shields.io/badge/ghcr.io-gobackup--docker-2496ED?logo=docker&logoColor=white)](https://github.com/ekho/gobackup-docker/pkgs/container/gobackup-docker)
 [![Go Report Card](https://goreportcard.com/badge/github.com/ekho/gobackup-docker)](https://goreportcard.com/report/github.com/ekho/gobackup-docker)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 `gobackup-docker` configures [gobackup](https://github.com/gobackup/gobackup) from **Docker container labels**
 instead of a hand-written `gobackup.yml`.
@@ -488,3 +489,8 @@ the small supervisor needs it (for discovery); gobackup does not. To harden, put
 [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy) in front of it, restricted to container
 list/inspect, and keep the whole stack on an internal network. Prefer the network+DSN path for databases so the
 socket is used only for discovery.
+
+## License
+
+[MIT](LICENSE) © Boris Gorbylev. Use, modify, and distribute freely — the only condition is that the copyright
+notice is retained in copies and substantial portions of the software (attribution may not be removed).
