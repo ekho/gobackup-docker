@@ -47,7 +47,7 @@ func main() {
 	}
 
 	writer := &apply.FileWriter{Path: outputPath}
-	rec := pipeline.NewReconciler(cfg, dc, writer)
+	rec := pipeline.NewReconciler(cfg, dc, writer).WithContainerManager(dc)
 
 	trigger := make(chan struct{}, 1)
 	fire := func() {
