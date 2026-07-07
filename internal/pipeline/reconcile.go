@@ -117,13 +117,12 @@ func (r *Reconciler) Run(ctx context.Context, trigger <-chan struct{}) {
 // reconcile does one full pass: list → parse+gate → render → apply. Any error
 // returns without applying, so the previously written config stays in place.
 func (r *Reconciler) reconcile(ctx context.Context) error {
-	models, nSources, changed, modelToContainer, creds, err := r.render(ctx)
+	cfg, nSources, modelToContainer, creds, err := r.render(ctx)
 	if err != nil {
-		r.mu.Lock()
-		r.status.LastError = err.Error()
-		r.mu.Unlock()
+		r.setLastError(err)
 		return err
 	}
+	models, _ := cfg["models"].(map[string]any)
 
 	// Phase 2: volume discovery — inspect source containers and re-mount their
 	// volumes into the gobackup engine under /volumes/<model>/..., transforming
@@ -136,17 +135,38 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 		}
 		sqliteMounts := r.processSqliteVolumes(ctx, models, modelToContainer)
 		managedMounts = dedupMountsByTarget(append(archiveMounts, sqliteMounts...))
-		if len(managedMounts) > 0 {
-			// Re-marshal and write since models' paths were transformed.
-			out, marshalErr := yaml.Marshal(map[string]any{"models": models})
-			if marshalErr != nil {
-				log.Printf("[reconcile] re-marshal after volume mapping: %v", marshalErr)
-			} else if changed2, applyErr := r.writer.Apply(out); applyErr != nil {
-				log.Printf("[reconcile] write after volume mapping: %v", applyErr)
-			} else {
-				changed = changed || changed2
-			}
-		}
+	}
+
+	// Escape literal '$' as the FINAL transform — after path rewriting — so volume
+	// discovery matched the real (unescaped) mount destinations, and the sentinel
+	// is applied only to the bytes actually written. gobackup runs os.ExpandEnv
+	// over the whole file, so a literal '$' in any value would be corrupted; the
+	// supervisor rewrites every '$' that is NOT a $NAME/${NAME} reference to
+	// ${GB_DOLLAR} and injects GB_DOLLAR=$ into the engine (Phase 3). In label-only
+	// mode it cannot inject the var, so it only warns. (A '$' shaped like a
+	// reference is left to expand — see render.EscapeConfig.)
+	escaped := false
+	if r.containerMgr != nil {
+		escaped = render.EscapeConfig(cfg)
+	} else if paths := render.BareDollarPaths(cfg); len(paths) > 0 {
+		log.Printf("[reconcile] %d value(s) contain a literal '$' that gobackup's env expansion will corrupt: %s. "+
+			"The supervisor auto-escapes these only when it manages the engine (Docker socket + label %s=%s); "+
+			"otherwise use a *_env/*_file credential label or write the value via ${VAR}.",
+			len(paths), strings.Join(paths, ", "), gobackupComponentLabel, gobackupComponentValue)
+	}
+
+	// A single atomic write of the fully-transformed, escaped config — never a
+	// raw-then-transformed pair, which would flip-flop the writer's dedup and
+	// briefly expose untransformed (unmounted) paths to the engine.
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		r.setLastError(err)
+		return err
+	}
+	changed, err := r.writer.Apply(out)
+	if err != nil {
+		r.setLastError(err)
+		return err
 	}
 
 	names := modelNames(models)
@@ -165,11 +185,18 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 	// Phase 3: resolve credential sources (from the client containers) into engine
 	// additions — env vars (_env) and secret bind-mounts + command exports (_file).
 	extras := engineExtras{ExtraMounts: managedMounts}
-	if r.containerMgr != nil && len(creds) > 0 {
-		ec := resolveCreds(ctx, r.containerMgr, creds)
-		extras.ExtraMounts = append(extras.ExtraMounts, ec.secretMounts...)
-		extras.EnvVars = ec.envVars
-		extras.SecretExports = ec.secretExports
+	if r.containerMgr != nil {
+		// Provide the sentinel var so ${GB_DOLLAR} in the config expands back to a
+		// literal '$' (see render.EscapeConfig). Only needed when something was escaped.
+		if escaped {
+			extras.EnvVars = append(extras.EnvVars, render.DollarSentinelVar+"="+render.DollarSentinelValue)
+		}
+		if len(creds) > 0 {
+			ec := resolveCreds(ctx, r.containerMgr, creds)
+			extras.ExtraMounts = append(extras.ExtraMounts, ec.secretMounts...)
+			extras.EnvVars = append(extras.EnvVars, ec.envVars...)
+			extras.SecretExports = ec.secretExports
+		}
 	}
 
 	// Phase 4: ensure the gobackup container matches the desired spec (mounts,
@@ -262,13 +289,15 @@ func lookupEnv(env []string, name string) (string, bool) {
 	return "", false
 }
 
-// render performs list→parse→build→apply, returning the models map, the
-// number of contributing containers, whether the file changed, and a mapping
-// from model name → source container ID for archive volume discovery.
-func (r *Reconciler) render(ctx context.Context) (models map[string]any, nSources int, changed bool, modelToContainer map[string]string, creds []render.ResolvedCred, err error) {
+// render performs list→parse→build, returning the config document (unwritten),
+// the number of contributing containers, a mapping from model name → source
+// container ID for volume discovery, and the credential sources to resolve. It
+// deliberately does NOT marshal or write: the caller applies volume-path
+// transforms and '$'-escaping first, then writes exactly once.
+func (r *Reconciler) render(ctx context.Context) (cfg map[string]any, nSources int, modelToContainer map[string]string, creds []render.ResolvedCred, err error) {
 	containers, err := r.lister.List(ctx)
 	if err != nil {
-		return nil, 0, false, nil, nil, err
+		return nil, 0, nil, nil, err
 	}
 
 	sources := make([]render.Source, 0, len(containers))
@@ -298,21 +327,18 @@ func (r *Reconciler) render(ctx context.Context) (models map[string]any, nSource
 	// error here aborts the reconcile and keeps the last-good file.
 	profiles, err := render.LoadProfiles(r.cfg.DefaultsPath)
 	if err != nil {
-		return nil, 0, false, nil, nil, err
+		return nil, 0, nil, nil, err
 	}
 
-	cfg, creds := render.BuildWithCreds(sources, profiles, r.cfg.HostID, r.cfg.Instance)
-	out, err := yaml.Marshal(cfg)
-	if err != nil {
-		return nil, 0, false, nil, nil, err
-	}
+	cfg, creds = render.BuildWithCreds(sources, profiles, r.cfg.HostID, r.cfg.Instance)
+	return cfg, len(sources), modelToContainer, creds, nil
+}
 
-	changed, err = r.writer.Apply(out)
-	if err != nil {
-		return nil, 0, false, nil, nil, err
-	}
-	models, _ = cfg["models"].(map[string]any)
-	return models, len(sources), changed, modelToContainer, creds, nil
+// setLastError records a reconcile error in the status snapshot.
+func (r *Reconciler) setLastError(err error) {
+	r.mu.Lock()
+	r.status.LastError = err.Error()
+	r.mu.Unlock()
 }
 
 // processArchiveVolumes discovers volume mounts for models with archive.includes

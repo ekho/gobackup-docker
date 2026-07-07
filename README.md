@@ -322,18 +322,49 @@ names verbose. Set `gobackup.name` (or a fixed `container_name`) for tidy, stabl
 
 - **`{{ .Model }}`** (also `{{ .Container }}`, `{{ .Host }}`, `{{ .Instance }}`) are Go-template tokens expanded by the
   **supervisor before the file is written**. Use them for names/paths.
-- **`${VAR}`** is left untouched by the supervisor and expanded by **gobackup at load time** (via `os.ExpandEnv`,
-  plus an auto-loaded sibling `.env`). Use it for secrets — keep credentials in env, never baked into a label.
+- **`${VAR}`** (brace form) is left untouched by the supervisor and expanded by **gobackup at load time** (via
+  `os.ExpandEnv` over the whole config file, plus an auto-loaded sibling `.env`). Use it for secrets — keep
+  credentials in env, never baked into a label.
 
 Two practical rules for `${VAR}`:
 
 - The variable must exist in the **gobackup** container's environment (that is where expansion happens), not the
   application/database container's.
-- In a **Compose** file, write `$$VAR` / `$${VAR}` in the label — Compose collapses `$$` to `$`, leaving the literal
-  `${VAR}` for gobackup. A single `$` would be interpolated (and likely blanked) by Compose itself.
+- In a **Compose** file, write `$${VAR}` or `$$VAR` in the label — Compose collapses `$$`→`$`, leaving `${VAR}`/`$VAR`
+  for gobackup to expand (both the braced and bare forms are recognized as references). A single `$` would be
+  interpolated (and likely blanked) by Compose itself.
 
 Never write `${MODEL}` for the model name: gobackup would treat it as an environment variable and blank it. That is
 why the supervisor uses `{{ ... }}`, and only for its own substitutions.
+
+#### Literal `$` in values is escaped automatically
+
+gobackup expands variables by running `os.ExpandEnv` over the **entire config file text** before parsing it. So **any**
+`$` in **any** value — most often a password like `m9qq!$7v!s^$!UU` — would be eaten as a variable reference and
+silently corrupted (→ `m9qq!v!s^UU`, an auth failure you'd chase for hours). YAML quoting can't prevent it: expansion
+happens on the raw bytes before the parser sees the quotes, and `os.ExpandEnv` has **no escape character** (`$$`→``,
+`\$`→`\`).
+
+So the supervisor keeps a `$` only when it begins a real **variable reference** — `$NAME` or `${NAME}`, where `NAME` is
+a letter followed by one or more letters/digits/underscores. Every other `$` is rewritten to `${GB_DOLLAR}`, a sentinel
+variable the supervisor sets to a literal `$` in the engine's environment; gobackup then expands `${GB_DOLLAR}` back to
+`$`, so the value round-trips exactly. Put a `$`-containing password like `m9qq!$7v!s^$!UU` straight in a label and it
+just works — no escaping gymnastics for the value itself (Compose-level `$$` is a separate layer, applied to how Compose
+reads your file).
+
+Consequences:
+
+- **Reference-shaped `$` still expands; everything else is kept literal.** `$DB_PASSWORD` and `${DB_PASSWORD}` are left
+  as-is and expanded by gobackup; `$7`, `$!`, a trailing `$`, `$$`, and even a too-short name like `$A` or `${A}` are
+  all preserved as a literal `$`.
+- This needs the supervisor to **manage the engine** (Docker socket + `gobackup-docker.component=gobackup`), because it
+  injects the `GB_DOLLAR` sentinel. In pure label-only mode it can't, so it instead **logs a warning** naming each
+  value with a to-be-escaped `$` — resolve those with a `*_env`/`*_file` credential label (see below) or by writing the
+  value through your own `${VAR}`.
+- **A `$` that looks like a reference is treated as one.** Because `$word` / `${word}` are, by definition, the reference
+  syntax, a secret that genuinely contains such a sequence (e.g. `p$word`, `Se${cret}`) is indistinguishable from a real
+  variable — the supervisor leaves it alone and gobackup expands it (to empty if unset). Supply such values via a
+  `*_env`/`*_file` credential label, which never round-trips through `os.ExpandEnv`.
 
 ### Credentials from an env var or a Docker secret
 

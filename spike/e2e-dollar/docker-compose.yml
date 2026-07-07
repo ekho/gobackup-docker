@@ -1,0 +1,63 @@
+# e2e for literal-'$' escaping: a postgres DB whose password contains '$'
+# characters (m9qq!$7v!s^$!UU). gobackup runs os.ExpandEnv over the whole config
+# file, so without escaping the '$7'/'$!' would be eaten and auth would fail. The
+# supervisor rewrites each bare '$' to ${GB_DOLLAR} and injects GB_DOLLAR=$ into
+# the engine, so gobackup reconstructs the exact password and pg_dump connects.
+#
+# NOTE: '$$' below is Compose escaping — Compose collapses '$$'→'$', so both the
+# postgres env and the label receive the real password m9qq!$7v!s^$!UU.
+name: gbde2edollar
+
+volumes:
+  cfg:
+  backups:
+
+networks:
+  net:
+    name: gbde2edollar_net
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: shopuser
+      POSTGRES_DB: shopdb
+      POSTGRES_PASSWORD: "m9qq!$$7v!s^$$!UU"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks: [net]
+    labels:
+      gobackup.enable: "true"
+      gobackup.name: "shop"
+      gobackup.databases.main.type: "postgresql"
+      gobackup.databases.main.host: "db"
+      gobackup.databases.main.database: "shopdb"
+      gobackup.databases.main.username: "shopuser"
+      gobackup.databases.main.password: "m9qq!$$7v!s^$$!UU"
+
+  gobackup:
+    image: huacnlee/gobackup:latest
+    command: ["/usr/local/bin/gobackup", "run", "-c", "/etc/gobackup/gobackup.yml"]
+    restart: unless-stopped
+    labels:
+      gobackup-docker.component: "gobackup"
+    volumes:
+      - cfg:/etc/gobackup
+      - backups:/backups
+    networks: [net]
+
+  gobackup-docker:
+    image: gobackup-docker:dev
+    labels:
+      gobackup_container.image: "huacnlee/gobackup:latest"
+      gobackup_container.command: "/usr/local/bin/gobackup run -c /etc/gobackup/gobackup.yml"
+      gobackup_container.networks: "gbde2edollar_net"
+    environment:
+      GOBACKUP_DOCKER_OUTPUT: /etc/gobackup/gobackup.yml
+      GOBACKUP_DOCKER_DEFAULTS: /etc/gobackup-docker/defaults.yml
+      GOBACKUP_DOCKER_DEBOUNCE: 300ms
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./defaults.yml:/etc/gobackup-docker/defaults.yml:ro
+      - cfg:/etc/gobackup
+    networks: [net]

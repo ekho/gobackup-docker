@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -399,6 +400,135 @@ func TestReconcile_sqliteVolumes(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("sqlite volume not mounted read-write into engine: %#v", cm.createdSpec.Mounts)
+	}
+}
+
+func TestReconcile_escapesDollarsWhenManaged(t *testing.T) {
+	defaults := writeDefaults(t, defaultsProfile)
+	out := filepath.Join(t.TempDir(), "gobackup.yml")
+
+	lister := &fakeLister{containers: []docker.Container{{
+		ID: "c1", Name: "bot",
+		Labels: map[string]string{
+			"gobackup.enable":                  "true",
+			"gobackup.name":                    "shop",
+			"gobackup.databases.main.type":     "postgresql",
+			"gobackup.databases.main.host":     "db",
+			"gobackup.databases.main.password": "m9qq!$7v!s^$!UU",
+		},
+	}}}
+	cm := &fakeContainerManager{
+		all: []docker.Container{{ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}}},
+		results: map[string]docker.InspectResult{
+			"c1":  {},
+			"gb1": {ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}},
+		},
+	}
+	r := NewReconciler(Config{DefaultsPath: defaults, HostID: "h"}, lister, &apply.FileWriter{Path: out}).WithContainerManager(cm)
+	if err := r.reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	b, _ := os.ReadFile(out)
+	if strings.Contains(string(b), "m9qq!$7v!s^$!UU") {
+		t.Errorf("raw unescaped password leaked into config:\n%s", b)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	got := doc["models"].(map[string]any)["shop"].(map[string]any)["databases"].(map[string]any)["main"].(map[string]any)["password"]
+	if got != "m9qq!${GB_DOLLAR}7v!s^${GB_DOLLAR}!UU" {
+		t.Errorf("password not escaped via sentinel: %q", got)
+	}
+
+	// Engine recreated with the sentinel var so gobackup's os.ExpandEnv restores '$'.
+	if cm.createdSpec == nil {
+		t.Fatal("engine was not recreated to inject the sentinel var")
+	}
+	if !containsString(cm.createdSpec.Env, "GB_DOLLAR=$") {
+		t.Errorf("sentinel GB_DOLLAR=$ not injected into engine env: %#v", cm.createdSpec.Env)
+	}
+
+	// End-to-end: the escaped value restores to the original under ExpandEnv.
+	t.Setenv("GB_DOLLAR", "$")
+	if exp := os.ExpandEnv(got.(string)); exp != "m9qq!$7v!s^$!UU" {
+		t.Errorf("escaped password does not restore under ExpandEnv: %q", exp)
+	}
+}
+
+func TestReconcile_labelOnlyDoesNotEscape(t *testing.T) {
+	defaults := writeDefaults(t, defaultsProfile)
+	out := filepath.Join(t.TempDir(), "gobackup.yml")
+	lister := &fakeLister{containers: []docker.Container{{
+		ID: "c1", Name: "bot",
+		Labels: map[string]string{
+			"gobackup.enable":                  "true",
+			"gobackup.name":                    "shop",
+			"gobackup.databases.main.type":     "postgresql",
+			"gobackup.databases.main.host":     "db",
+			"gobackup.databases.main.password": "m9qq!$7v!s^$!UU",
+		},
+	}}}
+	// No WithContainerManager → label-only mode: cannot inject the sentinel, so it
+	// must NOT escape (escaping without the var would expand '$' to empty — worse).
+	r := NewReconciler(Config{DefaultsPath: defaults, HostID: "h"}, lister, &apply.FileWriter{Path: out})
+	if err := r.reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	b, _ := os.ReadFile(out)
+	var doc map[string]any
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	got := doc["models"].(map[string]any)["shop"].(map[string]any)["databases"].(map[string]any)["main"].(map[string]any)["password"]
+	if got != "m9qq!$7v!s^$!UU" {
+		t.Errorf("label-only mode must not escape (no sentinel to inject); got %q", got)
+	}
+}
+
+func TestReconcile_pathTransformWriteIsStable(t *testing.T) {
+	// Regression: render() must not write a raw config that Phase 2 then rewrites —
+	// that flip-flops the writer's dedup (changed=true every pass) and briefly
+	// exposes untransformed (unmounted) paths. A single post-transform write must
+	// be content-stable across reconciles.
+	defaults := writeDefaults(t, defaultsProfile)
+	out := filepath.Join(t.TempDir(), "gobackup.yml")
+	lister := &fakeLister{containers: []docker.Container{{
+		ID: "c1", Name: "bot",
+		Labels: map[string]string{
+			"gobackup.enable":              "true",
+			"gobackup.name":                "shop",
+			"gobackup.databases.main.type": "sqlite",
+			"gobackup.databases.main.path": "/app/data/bot.sqlite3",
+		},
+	}}}
+	cm := &fakeContainerManager{
+		all: []docker.Container{{ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}}},
+		results: map[string]docker.InspectResult{
+			"c1":  {Mounts: []container.MountPoint{mpVolume("botdata", "/app/data")}},
+			"gb1": {ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}},
+		},
+	}
+	r := NewReconciler(Config{DefaultsPath: defaults, HostID: "h"}, lister, &apply.FileWriter{Path: out}).WithContainerManager(cm)
+
+	if err := r.reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	b1, _ := os.ReadFile(out)
+	if err := r.reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	if r.Status().LastChanged {
+		t.Error("second reconcile reported changed=true — writer is flip-flopping raw vs transformed")
+	}
+	b2, _ := os.ReadFile(out)
+	if string(b1) != string(b2) {
+		t.Errorf("config not stable across reconciles:\n--- first ---\n%s\n--- second ---\n%s", b1, b2)
+	}
+	// The single write produced the final, transformed config (not a raw one).
+	if !strings.Contains(string(b2), "/volumes/shop/app/data/bot.sqlite3") {
+		t.Errorf("transformed sqlite path missing from written config:\n%s", b2)
 	}
 }
 
