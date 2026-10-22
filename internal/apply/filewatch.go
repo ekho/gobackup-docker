@@ -31,16 +31,16 @@ func (w *FileWriter) Apply(cfg []byte) (changed bool, err error) {
 	if err := yaml.Unmarshal(cfg, &probe); err != nil {
 		return false, fmt.Errorf("refusing to write invalid YAML: %w", err)
 	}
-	if err := atomicWrite(w.Path, cfg); err != nil {
+	if err := AtomicWrite(w.Path, cfg, 0o644); err != nil {
 		return false, err
 	}
 	w.last = cfg
 	return true, nil
 }
 
-// atomicWrite writes to a temp file in the same directory, fsyncs, then renames
+// AtomicWrite writes to a temp file in the same directory, fsyncs, then renames
 // over the target so a reader (gobackup) never observes a partial file.
-func atomicWrite(path string, data []byte) error {
+func AtomicWrite(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".gobackup-*.yml.tmp")
 	if err != nil {
@@ -53,6 +53,10 @@ func atomicWrite(path string, data []byte) error {
 		tmp.Close()
 		return fmt.Errorf("write temp: %w", err)
 	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod temp: %w", err)
+	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return fmt.Errorf("sync temp: %w", err)
@@ -60,11 +64,13 @@ func atomicWrite(path string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp: %w", err)
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		return fmt.Errorf("chmod temp: %w", err)
-	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("rename over %s: %w", path, err)
 	}
-	return nil
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }

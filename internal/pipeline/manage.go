@@ -3,14 +3,18 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/errdefs"
 
+	"github.com/ekho/gobackup-docker/internal/apply"
 	gbcontainer "github.com/ekho/gobackup-docker/internal/container"
 	"github.com/ekho/gobackup-docker/internal/docker"
 )
@@ -33,6 +37,22 @@ const gobackupComponentValue = "gobackup"
 // container, so a subsequent reconcile recovers the base rather than re-wrapping
 // an already-wrapped command.
 const baseCmdLabel = "gobackup-docker.base-command"
+
+// Identifies our replacement even when Docker's create response is lost.
+const replacesLabel = "gobackup-docker.replaces"
+
+type pendingReplacement struct {
+	OldID string
+	Spec  docker.ContainerSpec
+}
+
+func (p pendingReplacement) validate() error {
+	if p.OldID == "" || p.Spec.Name == "" || p.Spec.Image == "" ||
+		p.Spec.Labels[gobackupComponentLabel] != gobackupComponentValue || p.Spec.Labels[replacesLabel] != p.OldID {
+		return errors.New("invalid gobackup replacement record")
+	}
+	return nil
+}
 
 // engineExtras are the supervisor-computed additions to the recreated gobackup
 // container: managed mounts (archive volumes + secret files), credential env
@@ -65,7 +85,30 @@ func ensureGobackupContainer(
 	mgr ContainerManager,
 	cfg gbcontainer.Config,
 	extras engineExtras,
+	pendingPath string,
 ) (string, bool, error) {
+	var recoveredID string
+	data, err := os.ReadFile(pendingPath)
+	if err == nil {
+		var pending pendingReplacement
+		if json.Unmarshal(data, &pending) != nil {
+			return "", false, errors.New("invalid gobackup replacement record JSON")
+		}
+		if err := pending.validate(); err != nil {
+			return "", false, err
+		}
+		recoveredID, err = resumeGobackupReplacement(ctx, mgr, pending, pendingPath)
+		if err != nil {
+			return "", false, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", false, fmt.Errorf("read gobackup replacement record: %w", err)
+	}
+	// Even with no current sources, an interrupted replacement must finish.
+	if len(extras.ExtraMounts) == 0 && len(extras.EnvVars) == 0 && len(extras.SecretExports) == 0 {
+		return recoveredID, recoveredID != "", nil
+	}
+
 	existing, err := findGobackupContainer(ctx, mgr)
 	if err != nil {
 		return "", false, fmt.Errorf("find gobackup container: %w", err)
@@ -83,33 +126,61 @@ func ensureGobackupContainer(
 	spec := buildGobackupSpec(cfg, *existing, desiredMounts, extras.EnvVars, extras.SecretExports)
 
 	if !needsRecreate(*existing, spec, extras.EnvVars) {
-		return existing.ID, false, nil
+		return existing.ID, recoveredID != "", nil
 	}
 
 	log.Printf("[manage] gobackup container %q spec changed — recreating", existing.Name)
-
-	log.Printf("[manage] stopping container %s ...", shortID(existing.ID))
-	if err := mgr.ContainerStop(ctx, existing.ID, nil); err != nil {
-		return "", false, fmt.Errorf("stop gobackup %s: %w", shortID(existing.ID), err)
+	spec.Labels[replacesLabel] = existing.ID
+	pending := pendingReplacement{OldID: existing.ID, Spec: spec}
+	if err := pending.validate(); err != nil {
+		return "", false, err
 	}
-
-	log.Printf("[manage] removing container %s ...", shortID(existing.ID))
-	if err := mgr.ContainerRemove(ctx, existing.ID, false); err != nil {
-		return "", false, fmt.Errorf("remove gobackup %s: %w", shortID(existing.ID), err)
-	}
-
-	newID, err := mgr.ContainerCreate(ctx, spec)
+	data, err = json.Marshal(pending)
 	if err != nil {
-		return "", false, fmt.Errorf("create gobackup: %w", err)
+		return "", false, fmt.Errorf("encode gobackup replacement record: %w", err)
 	}
-
-	log.Printf("[manage] starting new container %s ...", shortID(newID))
-	if err := mgr.ContainerStart(ctx, newID); err != nil {
-		return "", false, fmt.Errorf("start gobackup %s: %w", shortID(newID), err)
+	// Persist before any destructive operation; env values require private mode.
+	if err := apply.AtomicWrite(pendingPath, data, 0o600); err != nil {
+		return "", false, fmt.Errorf("save gobackup replacement record: %w", err)
 	}
+	id, err := resumeGobackupReplacement(ctx, mgr, pending, pendingPath)
+	return id, err == nil, err
+}
 
-	log.Printf("[manage] gobackup container recreated: %s -> %s", shortID(existing.ID), shortID(newID))
-	return newID, true, nil
+func resumeGobackupReplacement(ctx context.Context, mgr ContainerManager, p pendingReplacement, path string) (string, error) {
+	existing, err := mgr.ContainerInspect(ctx, p.Spec.Name)
+	if err != nil && !errdefs.IsNotFound(err) {
+		return "", fmt.Errorf("inspect gobackup replacement: %w", err)
+	}
+	id := existing.ID
+	if err == nil && id == p.OldID {
+		log.Printf("[manage] stopping container %s ...", shortID(id))
+		if err := mgr.ContainerStop(ctx, id, nil); err != nil && !errdefs.IsNotFound(err) && !errdefs.IsNotModified(err) {
+			return "", fmt.Errorf("stop gobackup %s: %w", shortID(id), err)
+		}
+		log.Printf("[manage] removing container %s ...", shortID(id))
+		if err := mgr.ContainerRemove(ctx, id, false); err != nil && !errdefs.IsNotFound(err) {
+			return "", fmt.Errorf("remove gobackup %s: %w", shortID(id), err)
+		}
+		id = ""
+	} else if err == nil && (existing.Labels[replacesLabel] != p.OldID || existing.Labels[gobackupComponentLabel] != gobackupComponentValue) {
+		return "", errors.New("gobackup replacement name is occupied by another container")
+	}
+	if id == "" {
+		id, err = mgr.ContainerCreate(ctx, p.Spec)
+		if err != nil {
+			return "", fmt.Errorf("create gobackup: %w", err)
+		}
+	}
+	log.Printf("[manage] starting replacement container %s ...", shortID(id))
+	if err := mgr.ContainerStart(ctx, id); err != nil && !errdefs.IsNotModified(err) {
+		return "", fmt.Errorf("start gobackup %s: %w", shortID(id), err)
+	}
+	if err := os.Remove(path); err != nil {
+		return "", fmt.Errorf("clear gobackup replacement record: %w", err)
+	}
+	log.Printf("[manage] gobackup container recreated: %s -> %s", shortID(p.OldID), shortID(id))
+	return id, nil
 }
 
 // secretExport binds an env var to a secret file path inside the engine
