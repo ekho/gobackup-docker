@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/errdefs"
 
 	"github.com/ekho/gobackup-docker/internal/apply"
 	gbcontainer "github.com/ekho/gobackup-docker/internal/container"
@@ -218,22 +221,45 @@ func TestRun_debounceCoalesces(t *testing.T) {
 // fakeContainerManager returns canned inspect results for archive volume tests.
 type fakeContainerManager struct {
 	results     map[string]docker.InspectResult
-	all         []docker.Container
 	createdSpec *docker.ContainerSpec // last spec passed to ContainerCreate
 }
 
 func (f *fakeContainerManager) ContainerInspect(_ context.Context, id string) (docker.InspectResult, error) {
-	return f.results[id], nil
+	if info, ok := f.results[id]; ok {
+		return info, nil
+	}
+	for _, info := range f.results {
+		if info.Name == id {
+			return info, nil
+		}
+	}
+	return docker.InspectResult{}, errdefs.NotFound(errors.New("container missing"))
 }
 func (f *fakeContainerManager) ContainerCreate(_ context.Context, spec docker.ContainerSpec) (string, error) {
 	f.createdSpec = &spec
+	info := docker.InspectResult{ID: "new-id", Name: spec.Name, Image: spec.Image, Command: spec.Command,
+		Env: spec.Env, Labels: spec.Labels, Networks: map[string]*network.EndpointSettings{}}
+	for _, m := range spec.Mounts {
+		info.Mounts = append(info.Mounts, container.MountPoint{Type: m.Type, Name: m.Source, Destination: m.Target, RW: !m.ReadOnly})
+	}
+	for _, n := range spec.Networks {
+		info.Networks[n] = &network.EndpointSettings{}
+	}
+	f.results["new-id"] = info
 	return "new-id", nil
 }
-func (f *fakeContainerManager) ContainerStart(_ context.Context, _ string) error          { return nil }
-func (f *fakeContainerManager) ContainerStop(_ context.Context, _ string, _ *int) error   { return nil }
-func (f *fakeContainerManager) ContainerRemove(_ context.Context, _ string, _ bool) error { return nil }
+func (f *fakeContainerManager) ContainerStart(_ context.Context, _ string) error        { return nil }
+func (f *fakeContainerManager) ContainerStop(_ context.Context, _ string, _ *int) error { return nil }
+func (f *fakeContainerManager) ContainerRemove(_ context.Context, id string, _ bool) error {
+	delete(f.results, id)
+	return nil
+}
 func (f *fakeContainerManager) ListAll(_ context.Context) ([]docker.Container, error) {
-	return f.all, nil
+	var out []docker.Container
+	for id, info := range f.results {
+		out = append(out, docker.Container{ID: id, Name: info.Name, Labels: info.Labels})
+	}
+	return out, nil
 }
 
 func TestReconcile_archiveVolumes(t *testing.T) {
@@ -257,6 +283,7 @@ func TestReconcile_archiveVolumes(t *testing.T) {
 
 	cm := &fakeContainerManager{
 		results: map[string]docker.InspectResult{
+			"old123456789": existingFixture(),
 			"c1": {Mounts: []container.MountPoint{
 				mpVolume("html_data", "/var/www/html"),
 				mpVolume("nginx_cfg", "/etc/nginx"),
@@ -312,9 +339,6 @@ func TestReconcile_recreateUsesGobackupSpec(t *testing.T) {
 	}}}
 
 	cm := &fakeContainerManager{
-		all: []docker.Container{
-			{ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}},
-		},
 		results: map[string]docker.InspectResult{
 			"c1": {Mounts: []container.MountPoint{mpVolume("html_data", "/var/www/html")}},
 			"gb1": {
@@ -366,10 +390,9 @@ func TestReconcile_sqliteVolumes(t *testing.T) {
 		},
 	}}}
 	cm := &fakeContainerManager{
-		all: []docker.Container{{ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}}},
 		results: map[string]docker.InspectResult{
 			"c1":  {Mounts: []container.MountPoint{mpVolume("botdata", "/app/data")}},
-			"gb1": {ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}},
+			"gb1": {ID: "gb1", Name: "gobackup", Image: "test/gobackup:1", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}},
 		},
 	}
 	r := NewReconciler(Config{DefaultsPath: defaults, HostID: "h"}, lister, &apply.FileWriter{Path: out}).WithContainerManager(cm)
@@ -418,10 +441,9 @@ func TestReconcile_escapesDollarsWhenManaged(t *testing.T) {
 		},
 	}}}
 	cm := &fakeContainerManager{
-		all: []docker.Container{{ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}}},
 		results: map[string]docker.InspectResult{
 			"c1":  {},
-			"gb1": {ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}},
+			"gb1": {ID: "gb1", Name: "gobackup", Image: "test/gobackup:1", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}},
 		},
 	}
 	r := NewReconciler(Config{DefaultsPath: defaults, HostID: "h"}, lister, &apply.FileWriter{Path: out}).WithContainerManager(cm)
@@ -504,10 +526,9 @@ func TestReconcile_pathTransformWriteIsStable(t *testing.T) {
 		},
 	}}}
 	cm := &fakeContainerManager{
-		all: []docker.Container{{ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}}},
 		results: map[string]docker.InspectResult{
 			"c1":  {Mounts: []container.MountPoint{mpVolume("botdata", "/app/data")}},
-			"gb1": {ID: "gb1", Name: "gobackup", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}},
+			"gb1": {ID: "gb1", Name: "gobackup", Image: "test/gobackup:1", Labels: map[string]string{gobackupComponentLabel: gobackupComponentValue}},
 		},
 	}
 	r := NewReconciler(Config{DefaultsPath: defaults, HostID: "h"}, lister, &apply.FileWriter{Path: out}).WithContainerManager(cm)

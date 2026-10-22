@@ -216,6 +216,13 @@ Rules:
   backup-source volumes (archive includes and SQLite database files) are managed. Never list them here.
 - The gobackup container **must already exist** and carry the label `gobackup-docker.component: "gobackup"` — that is
   how the supervisor finds the container to recreate. The supervisor recreates it; it does not create one from scratch.
+- Before stopping the engine, the supervisor atomically saves the replacement spec beside the output config as
+  `<GOBACKUP_DOCKER_OUTPUT>.container.json`. This temporary recovery record may contain environment secrets and is
+  written with mode `0600`; keep the output directory on a persistent, trusted volume. It is removed after the
+  replacement starts. Interrupted removals, creates, and starts resume on the next reconcile, including after a
+  supervisor restart. A missing engine without a recovery record still requires restoration from Compose.
+- Reconcile failures are exposed in the status API's `last_error` and retried after five seconds, even without new
+  Docker events. If another container takes the pending replacement's name, recovery fails visibly without changing it.
 - The supervisor needs the Docker socket mounted (`:ro` is sufficient — Docker API calls are socket messages, not
   file writes). gobackup itself never needs the socket.
 

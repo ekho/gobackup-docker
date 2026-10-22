@@ -5,6 +5,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sort"
 	"strings"
@@ -97,6 +98,7 @@ func (r *Reconciler) Status() Status {
 // the size-1 trigger channel and the debounce timer.
 func (r *Reconciler) Run(ctx context.Context, trigger <-chan struct{}) {
 	timer := time.NewTimer(r.cfg.Debounce)
+	defer timer.Stop()
 	if !timer.Stop() {
 		<-timer.C
 	}
@@ -108,15 +110,24 @@ func (r *Reconciler) Run(ctx context.Context, trigger <-chan struct{}) {
 			timer.Reset(r.cfg.Debounce)
 		case <-timer.C:
 			if err := r.reconcile(ctx); err != nil {
-				log.Printf("[reconcile] failed (keeping last config): %v", err)
+				log.Printf("[reconcile] failed, retrying in 5s: %v", err)
+				timer.Reset(5 * time.Second)
 			}
 		}
 	}
 }
 
-// reconcile does one full pass: list → parse+gate → render → apply. Any error
-// returns without applying, so the previously written config stays in place.
+// reconcile does one full pass: list → parse+gate → render → apply → sync engine.
+// Engine sync can fail after the rendered config has already been written.
 func (r *Reconciler) reconcile(ctx context.Context) error {
+	// Resume with the last written config even if new defaults or discovery fail.
+	if r.containerMgr != nil {
+		if _, _, err := ensureGobackupContainer(ctx, r.containerMgr, r.gobackupSpec, engineExtras{}, r.writer.Path+".container.json"); err != nil {
+			err = fmt.Errorf("gobackup container recovery: %w", err)
+			r.setLastError(err)
+			return err
+		}
+	}
 	cfg, nSources, modelToContainer, creds, err := r.render(ctx)
 	if err != nil {
 		r.setLastError(err)
@@ -175,7 +186,6 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 	r.status.Containers = nSources
 	r.status.LastRenderUnix = time.Now().Unix()
 	r.status.LastChanged = changed
-	r.status.LastError = ""
 	r.mu.Unlock()
 
 	if changed {
@@ -200,16 +210,20 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 	}
 
 	// Phase 4: ensure the gobackup container matches the desired spec (mounts,
-	// credential env, secret command-wrapper). Only touch it when there is
-	// something to manage — archive volumes or credentials.
-	if r.containerMgr != nil && (len(extras.ExtraMounts) > 0 || len(extras.EnvVars) > 0 || len(extras.SecretExports) > 0) {
-		if _, recreated, err := ensureGobackupContainer(ctx, r.containerMgr, r.gobackupSpec, extras); err != nil {
-			log.Printf("[reconcile] gobackup container sync: %v", err)
+	// credential env, secret command-wrapper), or finish an interrupted replacement.
+	if r.containerMgr != nil {
+		if _, recreated, err := ensureGobackupContainer(ctx, r.containerMgr, r.gobackupSpec, extras, r.writer.Path+".container.json"); err != nil {
+			err = fmt.Errorf("gobackup container sync: %w", err)
+			r.setLastError(err)
+			return err
 		} else if recreated {
 			log.Printf("[reconcile] gobackup container recreated (mounts/credentials)")
 		}
 	}
 
+	r.mu.Lock()
+	r.status.LastError = ""
+	r.mu.Unlock()
 	return nil
 }
 
